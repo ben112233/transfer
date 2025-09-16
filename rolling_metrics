@@ -1,0 +1,32 @@
+def calculate_time_window_metrics(df, time_windows=[30, 90, 180, 365, 730]):
+    """
+    Calculate response rates for multiple time windows (in days)
+    """
+    df = df.sort_values(['customer_id', 'product', 'timestamp'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    
+    for window in time_windows:
+        # Create rolling window calculations for each time period
+        rolling_acceptances = df.groupby(['customer_id', 'product']).apply(
+            lambda x: x.set_index('timestamp')['accepted'].rolling(f'{window}D').sum()
+        ).reset_index().rename(columns={'accepted': f'acceptances_{window}d'})
+        
+        rolling_offers = df.groupby(['customer_id', 'product']).apply(
+            lambda x: x.set_index('timestamp')['accepted'].rolling(f'{window}D').count()
+        ).reset_index().rename(columns={'accepted': f'offers_{window}d'})
+        
+        # Merge back to original dataframe
+        df = df.merge(rolling_acceptances, on=['customer_id', 'product', 'timestamp'], how='left')
+        df = df.merge(rolling_offers, on=['customer_id', 'product', 'timestamp'], how='left')
+        
+        # Calculate response rate for this window
+        df[f'response_rate_{window}d'] = np.where(
+            df[f'offers_{window}d'] > 0,
+            df[f'acceptances_{window}d'] / df[f'offers_{window}d'],
+            0
+        )
+    
+    return df
+
+# Calculate for 30, 90, 180, 365, and 730 day windows
+df = calculate_time_window_metrics(df)
