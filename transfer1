@@ -1,0 +1,148 @@
+import numpy as np
+import scipy.special
+import scipy.optimize
+
+class GammaBandit:
+    def __init__(self, n_arms, n_features, alpha=1.0, beta=1.0):
+        """
+        Gamma regression bandit for positive, continuous rewards
+        
+        Parameters:
+        n_arms: number of arms/actions
+        n_features: dimension of context vector
+        alpha: initial shape parameter for Gamma prior
+        beta: initial rate parameter for Gamma prior
+        """
+        self.n_arms = n_arms
+        self.n_features = n_features
+        
+        # Initialize Gamma prior parameters for each arm
+        # We use a mean-seeking parameterization: Gamma(α, β)
+        self.alpha = np.ones(n_arms) * alpha  # shape parameters
+        self.beta = np.ones(n_arms) * beta    # rate parameters
+        
+        # Sufficient statistics for each arm
+        self.sum_rewards = np.zeros(n_arms)
+        self.sum_log_rewards = np.zeros(n_arms)
+        self.n_pulls = np.zeros(n_arms)
+        
+        # Weight vectors for each arm (for the linear predictor)
+        self.weights = np.zeros((n_arms, n_features))
+        
+        # Context history for each arm (for regression updates)
+        self.contexts = [[] for _ in range(n_arms)]
+        self.rewards = [[] for _ in range(n_arms)]
+
+    def _gamma_log_likelihood(self, weights, contexts, rewards):
+        """Calculate negative log-likelihood for Gamma regression"""
+        # Linear predictor
+        linear_pred = contexts @ weights
+        
+        # Ensure positivity using exp link function
+        mu = np.exp(linear_pred)
+        
+        # Calculate negative log-likelihood
+        # Using Gamma distribution: p(y) = (β^α / Γ(α)) * y^(α-1) * e^(-βy)
+        # For regression, we typically parameterize with μ = α/β as the mean
+        # We'll use a constant shape parameter α and mean μ = exp(Xw)
+        alpha = 2.0  # fixed shape parameter (can be tuned or estimated)
+        beta = alpha / mu
+        
+        log_likelihood = (alpha * np.log(beta) - scipy.special.gammaln(alpha) + 
+                          (alpha - 1) * np.log(rewards) - beta * rewards)
+        
+        return -np.sum(log_likelihood)
+
+    def update(self, context, arm, reward):
+        """Update the bandit parameters for the chosen arm"""
+        # Store the context and reward
+        self.contexts[arm].append(context)
+        self.rewards[arm].append(reward)
+        
+        # Update sufficient statistics
+        self.sum_rewards[arm] += reward
+        self.sum_log_rewards[arm] += np.log(reward)
+        self.n_pulls[arm] += 1
+        
+        # If we have enough data, update the weights using Gamma regression
+        if self.n_pulls[arm] >= self.n_features + 1:  # Need at least n_features + 1 samples
+            contexts_arr = np.array(self.contexts[arm])
+            rewards_arr = np.array(self.rewards[arm])
+            
+            # Fit Gamma regression using maximum likelihood
+            result = scipy.optimize.minimize(
+                self._gamma_log_likelihood,
+                self.weights[arm],  # initial guess
+                args=(contexts_arr, rewards_arr),
+                method='L-BFGS-B',
+                options={'maxiter': 100}
+            )
+            
+            if result.success:
+                self.weights[arm] = result.x
+
+    def expected_rewards(self, context):
+        """Get expected rewards for all arms"""
+        expected = np.zeros(self.n_arms)
+        
+        for arm in range(self.n_arms):
+            if self.n_pulls[arm] > 0:
+                # Calculate linear predictor
+                linear_pred = context @ self.weights[arm]
+                
+                # Apply inverse link function (exp for Gamma regression)
+                # This gives us the estimated mean of the Gamma distribution
+                expected[arm] = np.exp(linear_pred)
+            else:
+                # Use prior mean if no data
+                expected[arm] = self.alpha[arm] / self.beta[arm]
+        
+        return expected
+
+    def choose_arm(self, context, exploration_weight=1.0):
+        """Choose an arm using Thompson sampling"""
+        samples = np.zeros(self.n_arms)
+        
+        for arm in range(self.n_arms):
+            if self.n_pulls[arm] > 0:
+                # Posterior parameters for Gamma distribution
+                post_alpha = self.alpha[arm] + self.n_pulls[arm]
+                post_beta = self.beta[arm] + self.sum_rewards[arm]
+                
+                # Sample from posterior Gamma distribution
+                samples[arm] = np.random.gamma(post_alpha, 1/post_beta)
+            else:
+                # Sample from prior if no data
+                samples[arm] = np.random.gamma(self.alpha[arm], 1/self.beta[arm])
+        
+        # Add regression component with exploration weight
+        expected = self.expected_rewards(context)
+        thompson_samples = expected + exploration_weight * (samples - expected)
+        
+        return np.argmax(thompson_samples)
+
+    def save_model(self, filepath):
+        """Save the model parameters to a file"""
+        model_params = {
+            'n_arms': self.n_arms,
+            'n_features': self.n_features,
+            'alpha': self.alpha,
+            'beta': self.beta,
+            'sum_rewards': self.sum_rewards,
+            'sum_log_rewards': self.sum_log_rewards,
+            'n_pulls': self.n_pulls,
+            'weights': self.weights
+        }
+        np.savez(filepath, **model_params)
+
+    def load_model(self, filepath):
+        """Load the model parameters from a file"""
+        model_params = np.load(filepath, allow_pickle=True)
+        self.n_arms = model_params['n_arms']
+        self.n_features = model_params['n_features']
+        self.alpha = model_params['alpha']
+        self.beta = model_params['beta']
+        self.sum_rewards = model_params['sum_rewards']
+        self.sum_log_rewards = model_params['sum_log_rewards']
+        self.n_pulls = model_params['n_pulls']
+        self.weights = model_params['weights']
