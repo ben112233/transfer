@@ -1,0 +1,225 @@
+import numpy as np
+import scipy.optimize
+import scipy.special
+from scipy.stats import beta
+
+class MultiObjectiveBetaBandit:
+    def __init__(self, n_arms, n_features, n_objectives=3, prior_alpha=1.0, prior_beta=1.0):
+        """
+        Multi-objective contextual bandit using Beta regression
+        
+        Parameters:
+        n_arms: number of arms/actions
+        n_features: dimension of context vector
+        n_objectives: number of reward objectives (default: 3)
+        prior_alpha: prior alpha parameter for Beta distribution
+        prior_beta: prior beta parameter for Beta distribution
+        """
+        self.n_arms = n_arms
+        self.n_features = n_features
+        self.n_objectives = n_objectives
+        
+        # Prior parameters for Beta distribution for each arm and objective
+        self.alpha_prior = np.ones((n_arms, n_objectives)) * prior_alpha
+        self.beta_prior = np.ones((n_arms, n_objectives)) * prior_beta
+        
+        # Posterior parameters (updated with data)
+        self.alpha = self.alpha_prior.copy()
+        self.beta = self.beta_prior.copy()
+        
+        # Weight vectors for contextual Beta regression for each arm and objective
+        self.weights = np.zeros((n_arms, n_objectives, n_features))
+        
+        # Store context and reward history for each arm
+        self.context_history = [[] for _ in range(n_arms)]
+        self.reward_history = [[] for _ in range(n_arms)]
+        
+        # Count pulls per arm
+        self.n_pulls = np.zeros(n_arms)
+
+    def _beta_log_likelihood(self, weights, context, reward, epsilon=1e-6):
+        """
+        Negative log-likelihood for Beta regression
+        Using logit link function: μ = exp(θ) / (1 + exp(θ)) where θ = Xβ
+        """
+        # Linear predictor
+        theta = np.dot(context, weights)
+        
+        # Apply logit link to get mean parameter μ (bounded between 0 and 1)
+        mu = 1.0 / (1.0 + np.exp(-theta))
+        
+        # Ensure mu is within (0, 1) for numerical stability
+        mu = np.clip(mu, epsilon, 1.0 - epsilon)
+        
+        # Calculate concentration parameters for Beta distribution
+        # We fix the sum α + β = k (precision parameter) and let μ = α / (α + β)
+        k = 10.0  # precision/fixed sum parameter (can be tuned)
+        alpha_param = mu * k
+        beta_param = (1.0 - mu) * k
+        
+        # Calculate log-likelihood for Beta distribution
+        log_likelihood = ((alpha_param - 1) * np.log(reward + epsilon) + 
+                          (beta_param - 1) * np.log(1.0 - reward + epsilon) -
+                          scipy.special.betaln(alpha_param, beta_param))
+        
+        return -np.sum(log_likelihood)
+
+    def update_beta_regression(self, arm, objective):
+        """Update Beta regression weights for a specific arm and objective"""
+        if len(self.context_history[arm]) <= self.n_features:
+            return  # Not enough data for regression
+        
+        contexts = np.array(self.context_history[arm])
+        rewards = np.array([r[objective] for r in self.reward_history[arm]])
+        
+        # Fit Beta regression using maximum likelihood
+        try:
+            result = scipy.optimize.minimize(
+                self._beta_log_likelihood,
+                self.weights[arm, objective],  # initial guess
+                args=(contexts, rewards),
+                method='L-BFGS-B',
+                bounds=[(-5, 5)] * self.n_features,  # Constrain weights for stability
+                options={'maxiter': 100, 'disp': False}
+            )
+            
+            if result.success:
+                self.weights[arm, objective] = result.x
+        except:
+            pass  # Handle optimization failures gracefully
+
+    def update(self, context, arm, reward_vector):
+        """Update the bandit parameters for the chosen arm"""
+        # Store context and reward
+        self.context_history[arm].append(context)
+        self.reward_history[arm].append(reward_vector)
+        self.n_pulls[arm] += 1
+        
+        # Update Beta distribution parameters using Bayesian update
+        for obj in range(self.n_objectives):
+            reward = reward_vector[obj]
+            
+            # Simple Bayesian update (can be combined with regression)
+            self.alpha[arm, obj] += reward
+            self.beta[arm, obj] += (1.0 - reward)
+            
+            # Update regression weights if we have enough data
+            if self.n_pulls[arm] > self.n_features:
+                self.update_beta_regression(arm, obj)
+
+    def expected_rewards(self, context):
+        """Get expected rewards for all arms and objectives"""
+        expected = np.zeros((self.n_arms, self.n_objectives))
+        
+        for arm in range(self.n_arms):
+            for obj in range(self.n_objectives):
+                if self.n_pulls[arm] > self.n_features:
+                    # Use regression prediction if we have enough data
+                    theta = np.dot(context, self.weights[arm, obj])
+                    mu = 1.0 / (1.0 + np.exp(-theta))
+                    expected[arm, obj] = mu
+                else:
+                    # Use simple Beta mean if not enough data
+                    expected[arm, obj] = self.alpha[arm, obj] / (self.alpha[arm, obj] + self.beta[arm, obj])
+        
+        return expected
+
+    def thompson_sample(self, context):
+        """Thompson sampling for multi-objective rewards"""
+        samples = np.zeros((self.n_arms, self.n_objectives))
+        
+        for arm in range(self.n_arms):
+            for obj in range(self.n_objectives):
+                # Sample from posterior Beta distribution
+                samples[arm, obj] = np.random.beta(self.alpha[arm, obj], self.beta[arm, obj])
+        
+        return samples
+
+    def choose_arm(self, context, method="thompson", weights=None):
+        """
+        Choose an arm based on context
+        
+        Parameters:
+        context: feature vector
+        method: "thompson" for Thompson sampling, "expected" for expected values
+        weights: weights for each objective (if None, uses equal weights)
+        """
+        if weights is None:
+            weights = np.ones(self.n_objectives) / self.n_objectives
+        
+        if method == "thompson":
+            # Thompson sampling: sample from posterior and weight objectives
+            samples = self.thompson_sample(context)
+            scores = np.dot(samples, weights)
+        else:
+            # Use expected values
+            expected = self.expected_rewards(context)
+            scores = np.dot(expected, weights)
+        
+        return np.argmax(scores)
+
+    def get_uncertainty(self, arm, objective):
+        """Get uncertainty (variance) for a specific arm and objective"""
+        alpha = self.alpha[arm, objective]
+        beta_val = self.beta[arm, objective]
+        total = alpha + beta_val
+        return (alpha * beta_val) / ((total ** 2) * (total + 1))
+
+    def save_model(self, filename):
+        """Save model parameters to file"""
+        model_data = {
+            'n_arms': self.n_arms,
+            'n_features': self.n_features,
+            'n_objectives': self.n_objectives,
+            'alpha': self.alpha,
+            'beta': self.beta,
+            'weights': self.weights,
+            'n_pulls': self.n_pulls
+        }
+        np.savez(filename, **model_data)
+
+    def load_model(self, filename):
+        """Load model parameters from file"""
+        data = np.load(filename, allow_pickle=True)
+        self.n_arms = data['n_arms']
+        self.n_features = data['n_features']
+        self.n_objectives = data['n_objectives']
+        self.alpha = data['alpha']
+        self.beta = data['beta']
+        self.weights = data['weights']
+        self.n_pulls = data['n_pulls']
+
+# Example usage and test
+def test_beta_bandit():
+    # Initialize bandit
+    n_arms = 5
+    n_features = 10
+    n_objectives = 3
+    bandit = MultiObjectiveBetaBandit(n_arms, n_features, n_objectives)
+    
+    # Simulate some user contexts and rewards
+    for i in range(1000):
+        context = np.random.normal(0, 1, n_features)
+        
+        # Choose arm
+        arm = bandit.choose_arm(context, method="thompson")
+        
+        # Simulate rewards for the chosen arm (3 objectives between 0-1)
+        true_means = 1.0 / (1.0 + np.exp(-context @ np.random.normal(0, 0.5, (n_arms, n_features)).T))
+        reward_vector = np.random.beta(5, 5 * (1/true_means[:, arm] - 1))  # Beta-distributed rewards
+        
+        # Update bandit
+        bandit.update(context, arm, reward_vector)
+        
+        if i % 100 == 0:
+            expected = bandit.expected_rewards(context)
+            print(f"Step {i}: Expected rewards for arms: {np.mean(expected, axis=1)}")
+    
+    # Test prediction
+    test_context = np.random.normal(0, 1, n_features)
+    expected_rewards = bandit.expected_rewards(test_context)
+    print("\nFinal expected rewards for test context:")
+    print(expected_rewards)
+
+if __name__ == "__main__":
+    test_beta_bandit()
