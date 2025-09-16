@@ -1,0 +1,58 @@
+def select_arm_with_threshold(expected_rewards, threshold=0.7, weights=[0.5, 0.5]):
+    """
+    Select arm based on threshold logic:
+    1. First check which arms have any value > threshold
+    2. If multiple arms have values > threshold, select the one with highest weighted sum
+    3. If no arms exceed threshold, select based on weighted sum of all arms
+    """
+    
+    expected_rewards = np.array(expected_rewards)
+    
+    # Step 1: Find arms where ANY objective exceeds threshold
+    above_threshold_mask = np.any(expected_rewards > threshold, axis=1)
+    above_threshold_arms = np.where(above_threshold_mask)[0]
+    
+    print(f"Arms above threshold {threshold}: {above_threshold_arms}")
+    for arm in above_threshold_arms:
+        print(f"  Arm {arm}: {expected_rewards[arm]}")
+    
+    # Step 2: If multiple arms exceed threshold
+    if len(above_threshold_arms) >= 2:
+        print("Multiple arms above threshold - selecting based on weighted sum")
+        # Calculate weighted sums only for arms above threshold
+        weighted_sums = np.dot(expected_rewards[above_threshold_arms], weights)
+        best_arm_index = np.argmax(weighted_sums)
+        selected_arm = above_threshold_arms[best_arm_index]
+        
+    # Step 3: If only one arm exceeds threshold
+    elif len(above_threshold_arms) == 1:
+        print("Single arm above threshold - selecting it")
+        selected_arm = above_threshold_arms[0]
+        
+    # Step 4: If no arms exceed threshold
+    else:
+        print("No arms above threshold - selecting based on overall weighted sum")
+        # Calculate weighted sums for all arms
+        weighted_sums = np.dot(expected_rewards, weights)
+        selected_arm = np.argmax(weighted_sums)
+    
+    # Get the final values for the selected arm
+    selected_values = expected_rewards[selected_arm]
+    weighted_sum = np.dot(selected_values, weights)
+    
+    print(f"Selected Arm: {selected_arm}")
+    print(f"Values: {selected_values}")
+    print(f"Weighted Sum: {weighted_sum:.4f}")
+    
+    return selected_arm
+
+# Example usage with your data
+context = ... # your context vector
+expected_rewards = bandit.expected_rewards_proba(context)
+
+print("Expected Rewards:")
+for i, rewards in enumerate(expected_rewards):
+    print(f"Arm {i}: {rewards}")
+
+# Select arm with custom weights (e.g., [0.6, 0.4] if first objective is more important)
+selected_arm = select_arm_with_threshold(expected_rewards, threshold=0.7, weights=[0.6, 0.4])
