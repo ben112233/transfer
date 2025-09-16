@@ -1,0 +1,372 @@
+
+# ========== NBA Model Revamp (Q-learning version; interface-compatible) ==========
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+
+np.random.seed(42)
+
+
+class MultiObjectiveLinearTS:
+    """Keep original class name and methods; swap core to Q-learning.
+    
+    - Original: Thompson Sampling + Bayesian linear updates (B/f/mu).
+    - Now:
+        * choice(): epsilon-greedy using linear Q(s,a) = theta_a^T x
+        * update(): TD update with gamma=0 (single-step task)
+        * expected_rewards(): still uses mu for 3-pillar display, to match original prints
+    """
+    def __init__(
+        self, n_arms, n_features, n_objectives, alpha=1.0,
+        q_lr=0.05,                 # Q learning rate
+        epsilon=0.10,              # epsilon-greedy initial exploration rate
+        epsilon_min=0.02,          # minimum epsilon
+        epsilon_decay=0.999,       # epsilon decay per update
+        gamma=0.0,                 # discount; 0 for single-step
+        reward_weights=(0.33, 0.34, 0.33),  # scalarization weights for 3 pillars
+        profit_normalizer=1.2      # normalize profit to ~[0,1] to avoid dominating
+    ):
+        # --- keep original attributes for expected_rewards ---
+        self.n_arms = n_arms
+        self.n_features = n_features
+        self.n_objectives = n_objectives
+        self.alpha = alpha  # not used in Q selection
+        
+        self.B = np.array([np.eye(n_features) for _ in range(n_arms * n_objectives)]) \
+            .reshape(n_arms, n_objectives, n_features, n_features)
+        self.mu = np.zeros((n_arms, n_objectives, n_features))
+        self.f = np.zeros((n_arms, n_objectives, n_features))
+
+        self.total_rewards = np.zeros((n_arms, n_objectives))
+        self.counts = np.zeros(n_arms)
+
+        # --- Q-learning parameters (linear function approximation) ---
+        self.q_theta = np.zeros((n_arms, n_features))  # theta_a for each action
+        self.q_lr = float(q_lr)
+        self.epsilon = float(epsilon)
+        self.epsilon_min = float(epsilon_min)
+        self.epsilon_decay = float(epsilon_decay)
+        self.gamma = float(gamma)
+        self.reward_weights = np.array(reward_weights, dtype=float)
+        self.profit_normalizer = float(profit_normalizer)
+
+    def choice(self, context):
+        """[Q-learning change] epsilon-greedy action selection on Q(s,a)."""
+        x = np.asarray(context).reshape(-1)
+        if np.random.rand() < self.epsilon:
+            return np.random.randint(self.n_arms)
+        q_values = self.q_theta @ x  # (n_arms,)
+        return int(np.argmax(q_values))
+
+    def update(self, context, arm, reward):
+        """[Q-learning change]
+        - TD update for selected action's Q (gamma=0 -> target=r_scalar)
+        - Keep B/f/mu updates ONLY for expected_rewards visualization
+        """
+        x = np.asarray(context).reshape(-1)
+        r_vec = np.asarray(reward).reshape(-1)
+
+        # scalarized immediate reward (normalize profit to ~[0,1])
+        r_scalar = (
+            self.reward_weights[0] * r_vec[0] +
+            self.reward_weights[1] * r_vec[1] +
+            self.reward_weights[2] * (r_vec[2] / self.profit_normalizer)
+        )
+
+        # TD update (gamma=0)
+        q_pred = float(self.q_theta[arm] @ x)
+        target = float(r_scalar)
+        td_error = target - q_pred
+        self.q_theta[arm] += self.q_lr * td_error * x
+
+        # decay epsilon
+        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+
+        # Keep B/f/mu updates for expected_rewards (not used for action selection)
+        self.counts[arm] += 1
+        self.total_rewards[arm] += r_vec
+        for obj in range(self.n_objectives):
+            self.B[arm, obj] += np.outer(x, x)
+            self.f[arm, obj] += r_vec[obj] * x
+            self.mu[arm, obj] = np.linalg.inv(self.B[arm, obj]) @ self.f[arm, obj]
+
+    def expected_rewards(self, context):
+        """Return (n_arms, n_objectives) expected rewards using mu (display only)."""
+        x = np.asarray(context).reshape(-1)
+        expected = np.zeros((self.n_arms, self.n_objectives))
+        for a in range(self.n_arms):
+            for obj in range(self.n_objectives):
+                expected[a, obj] = float(self.mu[a, obj] @ x)
+        return expected
+
+
+# 1. create dataset
+def create_banking_dataset(n_samples=100000):
+    np.random.seed(42)
+    data = {
+        'age': np.random.normal(45, 15, n_samples).clip(18, 80),
+        'income': np.random.lognormal(10.5, 0.8, n_samples).clip(20000, 200000),
+        'credit_score': np.random.normal(700, 100, n_samples).clip(300, 850),
+        'num_products': np.random.poisson(1.5, n_samples).clip(0, 5),
+        'savings_balance': np.random.exponential(5000, n_samples),
+        'checking_balance': np.random.exponential(3000, n_samples),
+        'days_since_last_login': np.random.exponential(7, n_samples),
+        'has_mortgage': np.random.binomial(1, 0.3, n_samples),
+        'is_premium_customer': np.random.binomial(1, 0.2, n_samples),
+    }
+    df = pd.DataFrame(data)
+    df['credit_score'] = df['credit_score'] + (df['income'] / 10000) * 5
+    df['savings_balance'] = df['savings_balance'] * (df['income'] / 50000)
+    return df
+
+print("Creating synthetic banking dataset...")
+df = create_banking_dataset(100000)
+print("Dataset shape:", df.shape)
+
+
+# 2. true reward function
+def calculate_true_rewards(user_features, arm):
+    """Returns [engagement, conversion, profit]
+    Add noise and clip to simulate real uncertainty.
+    """
+    age, income, credit_score, num_products = user_features[:4]
+
+    if arm == 0:  # Basic Savings Account
+        engage_prob = 0.6 + 0.001 * income / 1000
+        convert_prob = 0.4 + 0.0005 * income / 1000
+        profit = 0.1 + 0.00001 * income
+    elif arm == 1:  # Premium Credit Card
+        engage_prob = 0.3 + 0.002 * income / 1000 + 0.001 * credit_score
+        convert_prob = 0.2 + 0.0015 * income / 1000 + 0.002 * credit_score
+        profit = 0.7 + 0.00005 * income + 0.001 * credit_score
+    elif arm == 2:  # Home Loan Pre-approval
+        engage_prob = 0.2 + 0.003 * income / 1000 + 0.001 * age
+        convert_prob = 0.1 + 0.002 * income / 1000 + 0.002 * age
+        profit = 0.9 + 0.0001 * income + 0.002 * age
+    else:  # Retirement Plan
+        engage_prob = 0.4 + 0.002 * age + 0.001 * income / 1000
+        convert_prob = 0.3 + 0.0015 * age + 0.001 * income / 1000
+        profit = 0.5 + 0.00003 * income + 0.0015 * age
+
+    engage_prob = np.clip(engage_prob + np.random.normal(0, 0.1), 0.1, 0.95)
+    convert_prob = np.clip(convert_prob + np.random.normal(0, 0.08), 0.05, 0.9)
+    profit = np.clip(profit + np.random.normal(0, 0.05), 0.05, 1.2)
+
+    engagement = 1 if np.random.random() < engage_prob else 0
+    conversion = 1 if np.random.random() < convert_prob else 0
+
+    return np.array([engagement, conversion, profit])
+
+
+
+feature_columns = [
+    'age', 'income', 'credit_score', 'num_products',
+    'savings_balance', 'checking_balance', 'days_since_last_login',
+    'has_mortgage', 'is_premium_customer'
+]
+
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(df[feature_columns])
+
+n_arms = 4
+n_features = len(feature_columns)
+n_objectives = 3
+
+bandit = MultiObjectiveLinearTS(
+    n_arms=n_arms,
+    n_features=n_features,
+    n_objectives=n_objectives,
+    alpha=1.0,
+    q_lr=0.05,
+    epsilon=0.10,
+    epsilon_min=0.02,
+    epsilon_decay=0.999,
+    gamma=0.0,
+    reward_weights=(0.33, 0.34, 0.33),
+    profit_normalizer=1.2
+)
+
+
+print("\nTraining bandit (Q-learning) on historical data...")
+historical_rewards = []
+
+for i in tqdm(range(len(df))):
+    context = X_scaled[i]
+
+    # Keep original mixed strategy
+    if np.random.random() < 0.7:
+        user_income = df['income'].iloc[i]
+        user_credit = df['credit_score'].iloc[i]
+        user_age = df['age'].iloc[i]
+
+        if user_income > 100000 and user_credit > 750:
+            arm = np.random.choice([1, 2])
+        elif user_age > 50:
+            arm = np.random.choice([0, 3])
+        else:
+            arm = np.random.choice([0, 1])
+    else:
+        arm = np.random.randint(n_arms)
+
+    reward = calculate_true_rewards(df[feature_columns].iloc[i].values, arm)
+    historical_rewards.append(reward)
+    bandit.update(context, arm, reward)  # Q-learning TD update
+
+print("Training completed!")
+
+
+def evaluate_bandit(bandit, test_df, scaler, feature_columns, n_trials=150):
+    test_rewards = []
+    X_test = scaler.transform(test_df[feature_columns])
+    product_names = ['Savings Account', 'Credit Card', 'Home Loan', 'Retirement Plan']
+
+    print(f"\nEvaluation on test set ({len(test_df)} users)...")
+    for i in range(min(n_trials, len(test_df))):
+        context = X_test[i]
+        user_data = test_df.iloc[i]
+        recommended_arm = bandit.choice(context)
+        reward = calculate_true_rewards(user_data[feature_columns].values, recommended_arm)
+        test_rewards.append(reward)
+
+        if i < 3:
+            print(f"User {i}: Age={user_data['age']:.0f}, Income=${user_data['income']:.0f}, "
+                  f"Credit={user_data['credit_score']:.0f} -> "
+                  f"Recommended: {product_names[recommended_arm]} -> "
+                  f"Reward: Engagement={reward[0]}, Conversion={reward[1]}, Profit={reward[2]:.2f}")
+
+    test_rewards = np.array(test_rewards)
+    avg_rewards = test_rewards.mean(axis=0)
+    print(f"\nAverage Test Performance ({min(n_trials, len(test_df))} users):")
+    print(f"Engagement Rate: {avg_rewards[0]:.3f}")
+    print(f"Conversion Rate: {avg_rewards[1]:.3f}")
+    print(f"Average Profit: {avg_rewards[2]:.3f}")
+    return test_rewards
+
+
+
+train_df, test_df = train_test_split(df, test_size=0.3, random_state=42)
+test_rewards = evaluate_bandit(bandit, test_df, scaler, feature_columns, n_trials=150)
+
+
+def recommend_product(user_data, bandit, scaler, feature_columns):
+    user_df = pd.DataFrame([user_data])
+    context = scaler.transform(user_df[feature_columns])[0]
+    recommended_arm = bandit.choice(context)
+    expected_rewards = bandit.expected_rewards(context)  # display only
+    products = ['Basic Savings', 'Premium Credit Card', 'Home Loan', 'Retirement Plan']
+
+    print(f"\nRecommendation for user:")
+    print(f"Age: {user_data['age']}, Income: ${user_data['income']:.0f}, Credit Score: {user_data['credit_score']}")
+    print(f"Recommended product: {products[recommended_arm]}\n")
+    print("Expected outcomes for all products:")
+    for i, product in enumerate(products):
+        eng_prob = 1 / (1 + np.exp(-expected_rewards[i][0]))  # pretty display
+        conv_prob = 1 / (1 + np.exp(-expected_rewards[i][1]))
+        profit = expected_rewards[i][2]
+        print(f"{product}: Engagement={eng_prob:.3f}, Conversion={conv_prob:.3f}, Profit={profit:.3f}")
+    return recommended_arm
+
+new_users = [
+    {
+        'age': 28, 'income': 85000, 'credit_score': 720, 'num_products': 2,
+        'savings_balance': 12000, 'checking_balance': 5000, 'days_since_last_login': 2,
+        'has_mortgage': 0, 'is_premium_customer': 0
+    },
+    {
+        'age': 55, 'income': 145000, 'credit_score': 780, 'num_products': 3,
+        'savings_balance': 85000, 'checking_balance': 15000, 'days_since_last_login': 5,
+        'has_mortgage': 1, 'is_premium_customer': 1
+    },
+    {
+        'age': 35, 'income': 55000, 'credit_score': 650, 'num_products': 1,
+        'savings_balance': 8000, 'checking_balance': 3000, 'days_since_last_login': 15,
+        'has_mortgage': 0, 'is_premium_customer': 0
+    },
+]
+
+print("\n" + "="*60)
+print("PRODUCT RECOMMENDATIONS")
+print("="*60)
+for i, user in enumerate(new_users):
+    print(f"\n--- User {i+1} ---")
+    recommend_product(user, bandit, scaler, feature_columns)
+
+def compare_with_random(test_df, n_trials=100):
+    bandit_rewards = []
+    random_rewards = []
+    X_test = scaler.transform(test_df[feature_columns].iloc[:n_trials])
+
+    for i in range(n_trials):
+        context = X_test[i]
+        user_data = test_df.iloc[i]
+
+        bandit_arm = bandit.choice(context)
+        bandit_reward = calculate_true_rewards(user_data[feature_columns].values, bandit_arm)
+        bandit_rewards.append(bandit_reward)
+
+        random_arm = np.random.randint(n_arms)
+        random_reward = calculate_true_rewards(user_data[feature_columns].values, random_arm)
+        random_rewards.append(random_reward)
+
+    bandit_rewards = np.array(bandit_rewards)
+    random_rewards = np.array(random_rewards)
+
+    print("Comparison with Random Strategy:")
+    print(f"{'Metric':<12} {'Bandit':<8} {'Random':<8} {'Improvement':>12}")
+    print("-" * 48)
+
+    metrics = ['Engagement', 'Conversion', 'Profit']
+    for j, metric in enumerate(metrics):
+        bandit_avg = bandit_rewards[:, j].mean()
+        random_avg = random_rewards[:, j].mean()
+        improvement = ((bandit_avg - random_avg) / (random_avg + 1e-8)) * 100.0
+        print(f"{metric:<12} {bandit_avg:.3f}     {random_avg:.3f}     {improvement:+.1f}%")
+
+compare_with_random(test_df)
+
+plt.figure(figsize=(12, 8))
+
+# cumulative rewards
+cumulative_rewards = np.array(historical_rewards).cumsum(axis=0)
+plt.subplot(2, 2, 1)
+plt.plot(cumulative_rewards[:, 0], label='Engagement')
+plt.plot(cumulative_rewards[:, 1], label='Conversion')
+plt.plot(cumulative_rewards[:, 2], label='Profit')
+plt.xlabel("Users")
+plt.ylabel("Cumulative Reward")
+plt.title("Cumulative Rewards Over Time")
+plt.legend()
+
+# moving averages
+window = 100
+moving_avg = pd.DataFrame(historical_rewards).rolling(window=window).mean()
+plt.subplot(2, 2, 2)
+plt.plot(moving_avg[0], label='Engagement')
+plt.plot(moving_avg[1], label='Conversion')
+plt.plot(moving_avg[2], label='Profit')
+plt.xlabel("Users")
+plt.ylabel(f"Moving Average ({window} users)")
+plt.title("Performance Moving Average")
+plt.legend()
+
+# simple action preference sample using Q-choice
+products = ['Savings', 'Credit Card', 'Home Loan', 'Retirement']
+sample_idx = np.random.choice(len(df), size=min(5000, len(df)), replace=False)
+choice_counts = np.zeros(n_arms, dtype=int)
+for idx in sample_idx:
+    ctx = X_scaled[idx]
+    a = bandit.choice(ctx)
+    choice_counts[a] += 1
+
+plt.subplot(2, 2, 3)
+plt.bar(np.arange(n_arms), choice_counts)
+plt.xticks(np.arange(n_arms), products)
+plt.ylabel("Chosen Count (sampled)")
+plt.title("Action Preference by Q-learning")
+
+plt.tight_layout()
+plt.show()
+
