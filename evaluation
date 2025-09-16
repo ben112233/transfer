@@ -1,9 +1,7 @@
-def select_arm_with_threshold(expected_rewards, threshold=0.7, weights=[0.5, 0.5]):
+def select_and_rank_arms_above_threshold(expected_rewards, threshold=0.7, weights=[0.5, 0.5]):
     """
-    Select arm based on threshold logic:
-    1. First check which arms have any value > threshold
-    2. If multiple arms have values > threshold, select the one with highest weighted sum
-    3. If no arms exceed threshold, select based on weighted sum of all arms
+    Select ALL arms that have ANY value above threshold, then rank them by weighted sum
+    Returns: list of (arm_index, weighted_sum, values) tuples, sorted by weighted_sum descending
     """
     
     expected_rewards = np.array(expected_rewards)
@@ -16,43 +14,58 @@ def select_arm_with_threshold(expected_rewards, threshold=0.7, weights=[0.5, 0.5
     for arm in above_threshold_arms:
         print(f"  Arm {arm}: {expected_rewards[arm]}")
     
-    # Step 2: If multiple arms exceed threshold
-    if len(above_threshold_arms) >= 2:
-        print("Multiple arms above threshold - selecting based on weighted sum")
-        # Calculate weighted sums only for arms above threshold
+    # Step 2: If arms exceed threshold, rank them by weighted sum
+    if len(above_threshold_arms) > 0:
+        print("Ranking arms above threshold by weighted sum:")
+        
+        # Calculate weighted sums for arms above threshold
         weighted_sums = np.dot(expected_rewards[above_threshold_arms], weights)
-        best_arm_index = np.argmax(weighted_sums)
-        selected_arm = above_threshold_arms[best_arm_index]
         
-    # Step 3: If only one arm exceeds threshold
-    elif len(above_threshold_arms) == 1:
-        print("Single arm above threshold - selecting it")
-        selected_arm = above_threshold_arms[0]
+        # Create list of (arm_index, weighted_sum, values)
+        ranked_arms = []
+        for i, arm in enumerate(above_threshold_arms):
+            ranked_arms.append({
+                'arm_index': arm,
+                'weighted_sum': weighted_sums[i],
+                'values': expected_rewards[arm],
+                'exceeds_threshold': True
+            })
         
-    # Step 4: If no arms exceed threshold
+        # Sort by weighted sum descending
+        ranked_arms.sort(key=lambda x: x['weighted_sum'], reverse=True)
+        
     else:
-        print("No arms above threshold - selecting based on overall weighted sum")
+        print("No arms above threshold - ranking all arms by weighted sum")
         # Calculate weighted sums for all arms
         weighted_sums = np.dot(expected_rewards, weights)
-        selected_arm = np.argmax(weighted_sums)
+        
+        ranked_arms = []
+        for arm in range(len(expected_rewards)):
+            ranked_arms.append({
+                'arm_index': arm,
+                'weighted_sum': weighted_sums[arm],
+                'values': expected_rewards[arm],
+                'exceeds_threshold': False
+            })
+        
+        # Sort by weighted sum descending
+        ranked_arms.sort(key=lambda x: x['weighted_sum'], reverse=True)
     
-    # Get the final values for the selected arm
-    selected_values = expected_rewards[selected_arm]
-    weighted_sum = np.dot(selected_values, weights)
+    # Display ranking
+    print("\nRanking of arms:")
+    for i, arm_info in enumerate(ranked_arms):
+        status = "✅" if arm_info['exceeds_threshold'] else "  "
+        print(f"{i+1}. {status} Arm {arm_info['arm_index']}: "
+              f"sum={arm_info['weighted_sum']:.4f}, values={arm_info['values']}")
     
-    print(f"Selected Arm: {selected_arm}")
-    print(f"Values: {selected_values}")
-    print(f"Weighted Sum: {weighted_sum:.4f}")
+    return ranked_arms
+
+def get_top_recommendations(ranked_arms, top_k=3):
+    """Get top K recommendations from ranked arms"""
+    top_recommendations = ranked_arms[:top_k]
     
-    return selected_arm
-
-# Example usage with your data
-context = ... # your context vector
-expected_rewards = bandit.expected_rewards_proba(context)
-
-print("Expected Rewards:")
-for i, rewards in enumerate(expected_rewards):
-    print(f"Arm {i}: {rewards}")
-
-# Select arm with custom weights (e.g., [0.6, 0.4] if first objective is more important)
-selected_arm = select_arm_with_threshold(expected_rewards, threshold=0.7, weights=[0.6, 0.4])
+    print(f"\nTop {top_k} recommendations:")
+    for i, rec in enumerate(top_recommendations):
+        print(f"{i+1}. Arm {rec['arm_index']} (Score: {rec['weighted_sum']:.4f})")
+    
+    return top_recommendations
