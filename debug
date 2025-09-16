@@ -1,0 +1,36 @@
+def debug_bandit(bandit, num_tests=100):
+    """Run comprehensive diagnostics on the bandit"""
+    print("=== BANDIT DIAGNOSTICS ===")
+    
+    # Test 1: Check arm differentation
+    print("\n1. Arm Performance Summary:")
+    for arm in range(bandit.n_arms):
+        means = bandit.alpha[arm] / (bandit.alpha[arm] + bandit.beta[arm])
+        uncertainties = [bandit.get_uncertainty(arm, obj) for obj in range(bandit.n_objectives)]
+        print(f"Arm {arm}: Means={means}, Uncertainty={np.mean(uncertainties):.3f}, Pulls={bandit.n_pulls[arm]}")
+    
+    # Test 2: Check context predictive power
+    print("\n2. Context Analysis:")
+    for arm in range(bandit.n_arms):
+        if len(bandit.context_history[arm]) > 10:
+            contexts = np.array(bandit.context_history[arm])
+            variance = np.var(contexts, axis=0)
+            print(f"Arm {arm}: Context variance={variance}")
+    
+    # Test 3: Test predictions with varied contexts
+    print("\n3. Prediction Consistency Test:")
+    test_contexts = [np.random.normal(0, 1, bandit.n_features) for _ in range(5)]
+    for i, context in enumerate(test_contexts):
+        expected = bandit.expected_rewards(context)
+        print(f"Context {i}: Predictions={np.mean(expected, axis=1)}")
+    
+    # Test 4: Check reward distribution
+    print("\n4. Reward Distribution Analysis:")
+    for arm in range(bandit.n_arms):
+        if bandit.reward_history[arm]:
+            rewards = np.array(bandit.reward_history[arm])
+            print(f"Arm {arm}: Reward means={np.mean(rewards, axis=0)}, std={np.std(rewards, axis=0)}")
+
+# Usage in your main loop
+bandit = simulate_bandit_experiment()
+debug_bandit(bandit)
