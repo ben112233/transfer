@@ -1,11 +1,18 @@
+import numpy as np
+import scipy.optimize
+import scipy.special
+
 class MultiObjectiveBetaBandit:
-    def __init__(self, n_arms, n_features, n_objectives=3, prior_alpha=2.0, prior_beta=2.0):
+    def __init__(self, n_arms, n_features, n_objectives=3, prior_alpha=2.0, prior_beta=2.0, 
+                 regularization=0.1, exploration_factor=2.0):
         """
-        Multi-objective contextual bandit using Beta regression
+        Multi-objective contextual bandit using Beta regression with fixes for identified issues
         """
         self.n_arms = n_arms
         self.n_features = n_features
         self.n_objectives = n_objectives
+        self.regularization = regularization
+        self.exploration_factor = exploration_factor
         
         # Prior parameters for Beta distribution
         self.alpha = np.ones((n_arms, n_objectives)) * prior_alpha
@@ -40,60 +47,107 @@ class MultiObjectiveBetaBandit:
         return np.mean(uncertainties)
 
     def _beta_regression_loss(self, weights, contexts, rewards, epsilon=1e-6):
-        """Loss function for Beta regression with logit link"""
-        # Linear predictor
-        theta = np.dot(contexts, weights)
+        """Fixed regression loss function with stability improvements"""
+        try:
+            # Linear predictor
+            theta = np.dot(contexts, weights)
+            
+            # Apply logit link safely
+            theta_clipped = np.clip(theta, -10, 10)  # Prevent overflow
+            mu = 1.0 / (1.0 + np.exp(-theta_clipped))
+            mu = np.clip(mu, epsilon, 1.0 - epsilon)
+            
+            # Use variable precision based on data
+            k = 10.0 + len(rewards) / 10.0  # Increase precision with more data
+            
+            alpha_param = mu * k
+            beta_param = (1.0 - mu) * k
+            
+            # Stable log-likelihood calculation
+            log_rewards = np.log(np.clip(rewards, epsilon, 1.0))
+            log_one_minus = np.log(np.clip(1.0 - rewards, epsilon, 1.0))
+            
+            log_likelihood = ((alpha_param - 1) * log_rewards + 
+                             (beta_param - 1) * log_one_minus -
+                             scipy.special.betaln(alpha_param, beta_param))
+            
+            return -np.sum(log_likelihood)
+        except Exception as e:
+            # Return high loss if computation fails
+            return 1e10
+
+    def validate_regression(self, arm, objective, threshold=0.1):
+        """Check if regression weights are meaningful"""
+        if self.n_pulls[arm] < 50 or len(self.context_history[arm]) < 20:
+            return False
         
-        # Apply logit link to get mean parameter μ ∈ (0,1)
-        mu = 1.0 / (1.0 + np.exp(-theta))
-        mu = np.clip(mu, epsilon, 1.0 - epsilon)
+        contexts = np.array(self.context_history[arm])
+        rewards = np.array([r[objective] for r in self.reward_history[arm]])
         
-        # Fixed precision parameter
-        k = 20.0
-        alpha_param = mu * k
-        beta_param = (1.0 - mu) * k
+        # Check if weights have meaningful magnitude
+        if np.linalg.norm(self.weights[arm, objective]) < 0.1:
+            return False
         
-        # Beta log-likelihood
-        log_likelihood = ((alpha_param - 1) * np.log(rewards + epsilon) + 
-                         (beta_param - 1) * np.log(1.0 - rewards + epsilon) -
-                         scipy.special.betaln(alpha_param, beta_param))
+        # Check if contexts are diverse enough
+        context_variance = np.var(contexts, axis=0)
+        if not np.all(context_variance > 0.1):
+            return False
         
-        return -np.sum(log_likelihood)
+        # Test prediction improvement over mean
+        try:
+            predictions = 1.0 / (1.0 + np.exp(-np.dot(contexts, self.weights[arm, objective])))
+            mean_prediction = np.mean(rewards)
+            mse_regression = np.mean((predictions - rewards) ** 2)
+            mse_mean = np.mean((mean_prediction - rewards) ** 2)
+            
+            return mse_regression < mse_mean * (1 - threshold)
+        except:
+            return False
 
     def update(self, context, arm, reward_vector):
-        """Update bandit parameters with new observation"""
+        """Update bandit parameters with regularization to prevent overconfidence"""
         # Store context and reward
         self.context_history[arm].append(context)
         self.reward_history[arm].append(reward_vector)
         self.n_pulls[arm] += 1
         
-        # Update Beta parameters (simple Bayesian update)
+        # Update Beta parameters with regularization
         for obj in range(self.n_objectives):
             reward = reward_vector[obj]
-            self.alpha[arm, obj] += reward
-            self.beta[arm, obj] += (1.0 - reward)
             
-            # Update regression weights if we have enough data
-            if self.n_pulls[arm] > self.n_features:
+            # Add regularization to prevent certainty collapse
+            effective_reward = reward * (1 - self.regularization) + 0.5 * self.regularization
+            effective_failure = (1 - reward) * (1 - self.regularization) + 0.5 * self.regularization
+            
+            self.alpha[arm, obj] += effective_reward
+            self.beta[arm, obj] += effective_failure
+            
+            # Update regression only if we have sufficient diverse data
+            if (self.n_pulls[arm] > self.n_features * 2 and 
+                len(self.context_history[arm]) > 20):
+                
                 contexts = np.array(self.context_history[arm])
                 rewards = np.array([r[obj] for r in self.reward_history[arm]])
                 
-                try:
-                    result = scipy.optimize.minimize(
-                        self._beta_regression_loss,
-                        self.weights[arm, obj],
-                        args=(contexts, rewards),
-                        method='L-BFGS-B',
-                        bounds=[(-3, 3)] * self.n_features,
-                        options={'maxiter': 50, 'disp': False}
-                    )
-                    if result.success:
-                        self.weights[arm, obj] = result.x
-                except:
-                    pass
+                # Check if contexts are diverse enough for regression
+                context_variance = np.var(contexts, axis=0)
+                if np.all(context_variance > 0.1):  # Only update if contexts are diverse
+                    try:
+                        result = scipy.optimize.minimize(
+                            self._beta_regression_loss,
+                            self.weights[arm, obj],
+                            args=(contexts, rewards),
+                            method='L-BFGS-B',
+                            bounds=[(-5, 5)] * self.n_features,
+                            options={'maxiter': 100, 'ftol': 1e-4, 'disp': False}
+                        )
+                        if result.success:
+                            self.weights[arm, obj] = result.x
+                    except:
+                        pass
         
         # Log performance periodically
-        if np.sum(self.n_pulls) % 50 == 0:
+        if np.sum(self.n_pulls) % 100 == 0:
             self._log_performance()
 
     def _log_performance(self):
@@ -102,61 +156,85 @@ class MultiObjectiveBetaBandit:
             'total_pulls': np.sum(self.n_pulls),
             'arm_pulls': self.n_pulls.copy(),
             'arm_means': [self.alpha[arm] / (self.alpha[arm] + self.beta[arm]) for arm in range(self.n_arms)],
-            'arm_uncertainties': [self.get_arm_uncertainty(arm) for arm in range(self.n_arms)]
+            'arm_uncertainties': [self.get_arm_uncertainty(arm) for arm in range(self.n_arms)],
+            'regression_valid': [np.mean([self.validate_regression(arm, obj) for obj in range(self.n_objectives)]) 
+                               for arm in range(self.n_arms)]
         }
         self.performance_history.append(performance)
-        print(f"Performance update - Total pulls: {performance['total_pulls']}")
+        print(f"\nPerformance update - Total pulls: {performance['total_pulls']}")
         for arm in range(self.n_arms):
             print(f"  Arm {arm}: pulls={performance['arm_pulls'][arm]}, "
-                  f"means={performance['arm_means'][arm]}, "
-                  f"uncertainty={performance['arm_uncertainties'][arm]:.3f}")
+                  f"means={[f'{m:.3f}' for m in performance['arm_means'][arm]]}, "
+                  f"uncertainty={performance['arm_uncertainties'][arm]:.3f}, "
+                  f"regression_ok={performance['regression_valid'][arm]:.2f}")
 
     def expected_rewards(self, context):
-        """Get expected rewards for all arms and objectives"""
+        """Enhanced expected rewards with regression diagnostics and fallback"""
         expected = np.zeros((self.n_arms, self.n_objectives))
         
         for arm in range(self.n_arms):
             for obj in range(self.n_objectives):
-                if self.n_pulls[arm] > max(20, self.n_features * 2):
-                    # Use regression prediction
-                    theta = np.dot(context, self.weights[arm, obj])
-                    mu = 1.0 / (1.0 + np.exp(-theta))
-                    expected[arm, obj] = mu
+                # Use regression only if it's validated and meaningful
+                use_regression = (self.validate_regression(arm, obj) and 
+                                 self.n_pulls[arm] > max(50, self.n_features * 3) and
+                                 np.linalg.norm(self.weights[arm, obj]) > 0.1)
+                
+                if use_regression:
+                    try:
+                        # Use regression prediction
+                        theta = np.dot(context, self.weights[arm, obj])
+                        theta = np.clip(theta, -10, 10)  # Prevent overflow
+                        mu = 1.0 / (1.0 + np.exp(-theta))
+                        
+                        # Check if prediction is reasonable compared to historical mean
+                        historical_mean = self.alpha[arm, obj] / (self.alpha[arm, obj] + self.beta[arm, obj])
+                        if abs(mu - historical_mean) > 0.4:
+                            # Regression prediction too far from historical mean - might be unreliable
+                            expected[arm, obj] = historical_mean
+                        else:
+                            expected[arm, obj] = mu
+                            
+                    except:
+                        expected[arm, obj] = self.alpha[arm, obj] / (self.alpha[arm, obj] + self.beta[arm, obj])
                 else:
-                    # Use Beta mean
+                    # Use simple Beta mean
                     expected[arm, obj] = self.alpha[arm, obj] / (self.alpha[arm, obj] + self.beta[arm, obj])
         
         return np.clip(expected, 0.01, 0.99)
 
-    def choose_arm(self, context, method="thompson", objective_weights=None, exploration_factor=0.5):
-        """Choose arm using Thompson sampling or expected values with exploration"""
+    def choose_arm(self, context, method="ucb", objective_weights=None):
+        """Choose arm with better exploration strategy"""
         if objective_weights is None:
             objective_weights = np.ones(self.n_objectives) / self.n_objectives
         
-        if method == "thompson":
-            # Thompson sampling with exploration bonus
+        if method == "ucb":
+            # Upper Confidence Bound with better exploration
             scores = np.zeros(self.n_arms)
+            total_pulls = np.sum(self.n_pulls)
             
             for arm in range(self.n_arms):
-                # Sample from posterior Beta distribution
-                sample = np.array([np.random.beta(self.alpha[arm, obj], self.beta[arm, obj]) 
-                                 for obj in range(self.n_objectives)])
+                # Get expected rewards
+                expected = self.expected_rewards(context)[arm]
+                base_score = np.dot(expected, objective_weights)
                 
-                # Calculate base score
-                base_score = np.dot(sample, objective_weights)
+                # Calculate uncertainty bonus (UCB formula)
+                if self.n_pulls[arm] > 0:
+                    uncertainty_bonus = self.exploration_factor * np.sqrt(np.log(total_pulls + 1) / self.n_pulls[arm])
+                else:
+                    uncertainty_bonus = self.exploration_factor * 5.0  # Large bonus for unexplored arms
                 
-                # Add exploration bonus based on uncertainty
-                uncertainty = self.get_arm_uncertainty(arm)
-                exploration_bonus = exploration_factor * uncertainty
-                
-                scores[arm] = base_score + exploration_bonus
+                scores[arm] = base_score + uncertainty_bonus
             
             return np.argmax(scores)
-            
+        
         else:
-            # Use expected values
-            expected = self.expected_rewards(context)
-            scores = np.dot(expected, objective_weights)
+            # Fallback to Thompson sampling
+            samples = np.zeros((self.n_arms, self.n_objectives))
+            for arm in range(self.n_arms):
+                for obj in range(self.n_objectives):
+                    samples[arm, obj] = np.random.beta(self.alpha[arm, obj], self.beta[arm, obj])
+            
+            scores = np.dot(samples, objective_weights)
             return np.argmax(scores)
 
     def get_arm_statistics(self, arm):
@@ -166,6 +244,147 @@ class MultiObjectiveBetaBandit:
             'means': self.alpha[arm] / (self.alpha[arm] + self.beta[arm]),
             'uncertainties': [self.get_uncertainty(arm, obj) for obj in range(self.n_objectives)],
             'alpha_params': self.alpha[arm].copy(),
-            'beta_params': self.beta[arm].copy()
+            'beta_params': self.beta[arm].copy(),
+            'weight_norms': [np.linalg.norm(self.weights[arm, obj]) for obj in range(self.n_objectives)],
+            'regression_valid': [self.validate_regression(arm, obj) for obj in range(self.n_objectives)]
         }
         return stats
+
+    def debug_bandit(self):
+        """Run comprehensive diagnostics on the bandit"""
+        print("=== BANDIT DIAGNOSTICS ===")
+        print(f"Total pulls: {np.sum(self.n_pulls)}")
+        print(f"Regularization: {self.regularization}")
+        print(f"Exploration factor: {self.exploration_factor}")
+        
+        print("\n1. Arm Performance Summary:")
+        for arm in range(self.n_arms):
+            stats = self.get_arm_statistics(arm)
+            print(f"Arm {arm}: pulls={stats['pulls']}, "
+                  f"means={[f'{m:.3f}' for m in stats['means']]}, "
+                  f"uncertainty={np.mean(stats['uncertainties']):.3f}, "
+                  f"weight_norms={[f'{n:.3f}' for n in stats['weight_norms']]}, "
+                  f"regression_ok={np.mean(stats['regression_valid']):.2f}")
+        
+        print("\n2. Reward Distribution Analysis:")
+        for arm in range(self.n_arms):
+            if self.reward_history[arm]:
+                rewards = np.array(self.reward_history[arm])
+                print(f"Arm {arm}: Reward means={[f'{m:.3f}' for m in np.mean(rewards, axis=0)]}, "
+                      f"std={[f'{s:.3f}' for s in np.std(rewards, axis=0)]}")
+        
+        print("\n3. Context Diversity Analysis:")
+        for arm in range(self.n_arms):
+            if self.context_history[arm]:
+                contexts = np.array(self.context_history[arm])
+                variances = np.var(contexts, axis=0)
+                print(f"Arm {arm}: Context variance={[f'{v:.3f}' for v in variances]}, "
+                      f"mean_variance={np.mean(variances):.3f}")
+        
+        print("\n4. Prediction Test:")
+        test_contexts = [np.random.normal(0, 1, self.n_features) for _ in range(3)]
+        for i, context in enumerate(test_contexts):
+            predictions = self.expected_rewards(context)
+            print(f"Context {i}: Predictions={[f'{np.mean(pred):.3f}' for pred in predictions]}")
+
+    def save_model(self, filename):
+        """Save model parameters to file"""
+        model_data = {
+            'n_arms': self.n_arms,
+            'n_features': self.n_features,
+            'n_objectives': self.n_objectives,
+            'alpha': self.alpha,
+            'beta': self.beta,
+            'weights': self.weights,
+            'n_pulls': self.n_pulls,
+            'regularization': self.regularization,
+            'exploration_factor': self.exploration_factor
+        }
+        np.savez(filename, **model_data)
+
+    def load_model(self, filename):
+        """Load model parameters from file"""
+        data = np.load(filename, allow_pickle=True)
+        self.n_arms = data['n_arms']
+        self.n_features = data['n_features']
+        self.n_objectives = data['n_objectives']
+        self.alpha = data['alpha']
+        self.beta = data['beta']
+        self.weights = data['weights']
+        self.n_pulls = data['n_pulls']
+        self.regularization = data['regularization']
+        self.exploration_factor = data['exploration_factor']
+
+
+# Example usage with your reward function
+def calculate_true_rewards(user_features, engagement_base, revenue_increment_base, 
+                          diversity_base, arm, simulate=False):
+    """
+    Calculate true rewards for a user and product arm
+    Returns: [engagement, revenue_increment, product_diversity] bounded between [0,1]
+    """
+    if simulate:
+        # Create distinct reward patterns for each arm
+        arm_multipliers = [1.0, 1.2, 0.8, 1.1, 0.9, 1.3, 0.7, 1.0, 1.1, 0.95][:arm+1]
+        
+        engagement = np.random.gamma(2, engagement_base[str(arm)+'.mean']/2) * arm_multipliers[arm]
+        revenue_increment = np.random.gamma(2, revenue_increment_base[str(arm)+'.mean']/2) * arm_multipliers[arm]
+        product_diversity = np.random.gamma(2, diversity_base[str(arm)+'.mean']/2) * arm_multipliers[arm]
+        
+        # Apply sigmoid with different scaling for better separation
+        engagement = 1.0 / (1.0 + np.exp(-engagement * 1.5))
+        revenue_increment = 1.0 / (1.0 + np.exp(-revenue_increment * 1.5))
+        product_diversity = 1.0 / (1.0 + np.exp(-product_diversity * 1.5))
+        
+        # Add arm-specific biases
+        arm_biases = [0.0, 0.15, -0.1, 0.08, -0.05, 0.2, -0.15, 0.0, 0.1, -0.08][:arm+1]
+        engagement += arm_biases[arm]
+        revenue_increment += arm_biases[arm]
+        product_diversity += arm_biases[arm]
+        
+        return np.clip([engagement, revenue_increment, product_diversity], 0.01, 0.99)
+    else:  
+        engagement = user_features[-3]  
+        revenue_increment = user_features[-2]  
+        product_diversity = user_features[-1]
+        return [engagement, revenue_increment, product_diversity]
+
+
+def simulate_bandit_experiment():
+    """Test the bandit with simulated data"""
+    n_arms = 10
+    n_features = 5
+    bandit = MultiObjectiveBetaBandit(n_arms, n_features, regularization=0.2, exploration_factor=2.5)
+    
+    # Example base parameters
+    engagement_base = {f'{i}.mean': np.random.uniform(0.3, 0.8) for i in range(n_arms)}
+    revenue_increment_base = {f'{i}.mean': np.random.uniform(0.2, 0.7) for i in range(n_arms)}
+    diversity_base = {f'{i}.mean': np.random.uniform(0.4, 0.9) for i in range(n_arms)}
+    
+    # Simulation loop
+    for i in range(2000):
+        # Generate random user features
+        user_features = np.random.normal(0, 1, n_features + 3)  # +3 for reward components
+        
+        # Choose arm
+        arm = bandit.choose_arm(user_features[:n_features], method="ucb")
+        
+        # Calculate rewards
+        rewards = calculate_true_rewards(
+            user_features, engagement_base, revenue_increment_base, 
+            diversity_base, arm, simulate=True
+        )
+        
+        # Update bandit
+        bandit.update(user_features[:n_features], arm, rewards)
+        
+        if i % 500 == 0:
+            bandit.debug_bandit()
+    
+    return bandit
+
+
+if __name__ == "__main__":
+    bandit = simulate_bandit_experiment()
+    print("\n=== FINAL BANDIT STATE ===")
+    bandit.debug_bandit()
