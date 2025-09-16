@@ -1,38 +1,3 @@
-import numpy as np
-import scipy.optimize
-import scipy.special
-from scipy.stats import beta
-
-def calculate_true_rewards(user_features, engagement_base, revenue_increment_base, 
-                          diversity_base, arm, simulate=False):
-    """
-    Calculate true rewards for a user and product arm
-    Returns: [engagement, revenue_increment, product_diversity] bounded between [0,1]
-    """
-    if simulate:
-        # Generate Gamma-distributed values (positive and continuous)
-        engagement = np.random.gamma(2, engagement_base[str(arm)+'.mean']/2)
-        revenue_increment = np.random.gamma(2, revenue_increment_base[str(arm)+'.mean']/2)
-        product_diversity = np.random.gamma(2, diversity_base[str(arm)+'.mean']/2)
-        
-        # Convert to [0,1] range using logistic function for Beta regression compatibility
-        # This ensures rewards are properly bounded for Beta distribution
-        engagement = 1.0 / (1.0 + np.exp(-engagement))
-        revenue_increment = 1.0 / (1.0 + np.exp(-revenue_increment))
-        product_diversity = 1.0 / (1.0 + np.exp(-product_diversity))
-        
-        # Add some noise and ensure within bounds
-        engagement = np.clip(engagement + np.random.normal(0, 0.05), 0.01, 0.99)
-        revenue_increment = np.clip(revenue_increment + np.random.normal(0, 0.05), 0.01, 0.99)
-        product_diversity = np.clip(product_diversity + np.random.normal(0, 0.05), 0.01, 0.99)
-    else:  
-        # Use direct features (assuming they're already in [0,1])
-        engagement = user_features[-3]  
-        revenue_increment = user_features[-2]  
-        product_diversity = user_features[-1]
-    
-    return [engagement, revenue_increment, product_diversity]
-
 class MultiObjectiveBetaBandit:
     def __init__(self, n_arms, n_features, n_objectives=3, prior_alpha=2.0, prior_beta=2.0):
         """
@@ -53,6 +18,26 @@ class MultiObjectiveBetaBandit:
         self.context_history = [[] for _ in range(n_arms)]
         self.reward_history = [[] for _ in range(n_arms)]
         self.n_pulls = np.zeros(n_arms)
+        
+        # Performance tracking
+        self.performance_history = []
+
+    def get_uncertainty(self, arm, objective):
+        """
+        Calculate uncertainty (variance) for a specific arm and objective
+        Variance of Beta(α, β) = (α * β) / ((α + β)^2 * (α + β + 1))
+        """
+        alpha_val = self.alpha[arm, objective]
+        beta_val = self.beta[arm, objective]
+        total = alpha_val + beta_val
+        if total == 0:
+            return 1.0  # Maximum uncertainty if no data
+        return (alpha_val * beta_val) / ((total ** 2) * (total + 1))
+
+    def get_arm_uncertainty(self, arm):
+        """Get average uncertainty across all objectives for an arm"""
+        uncertainties = [self.get_uncertainty(arm, obj) for obj in range(self.n_objectives)]
+        return np.mean(uncertainties)
 
     def _beta_regression_loss(self, weights, contexts, rewards, epsilon=1e-6):
         """Loss function for Beta regression with logit link"""
@@ -100,12 +85,31 @@ class MultiObjectiveBetaBandit:
                         args=(contexts, rewards),
                         method='L-BFGS-B',
                         bounds=[(-3, 3)] * self.n_features,
-                        options={'maxiter': 50}
+                        options={'maxiter': 50, 'disp': False}
                     )
                     if result.success:
                         self.weights[arm, obj] = result.x
                 except:
                     pass
+        
+        # Log performance periodically
+        if np.sum(self.n_pulls) % 50 == 0:
+            self._log_performance()
+
+    def _log_performance(self):
+        """Monitor bandit performance"""
+        performance = {
+            'total_pulls': np.sum(self.n_pulls),
+            'arm_pulls': self.n_pulls.copy(),
+            'arm_means': [self.alpha[arm] / (self.alpha[arm] + self.beta[arm]) for arm in range(self.n_arms)],
+            'arm_uncertainties': [self.get_arm_uncertainty(arm) for arm in range(self.n_arms)]
+        }
+        self.performance_history.append(performance)
+        print(f"Performance update - Total pulls: {performance['total_pulls']}")
+        for arm in range(self.n_arms):
+            print(f"  Arm {arm}: pulls={performance['arm_pulls'][arm]}, "
+                  f"means={performance['arm_means'][arm]}, "
+                  f"uncertainty={performance['arm_uncertainties'][arm]:.3f}")
 
     def expected_rewards(self, context):
         """Get expected rewards for all arms and objectives"""
@@ -113,7 +117,7 @@ class MultiObjectiveBetaBandit:
         
         for arm in range(self.n_arms):
             for obj in range(self.n_objectives):
-                if self.n_pulls[arm] > self.n_features:
+                if self.n_pulls[arm] > max(20, self.n_features * 2):
                     # Use regression prediction
                     theta = np.dot(context, self.weights[arm, obj])
                     mu = 1.0 / (1.0 + np.exp(-theta))
@@ -124,66 +128,44 @@ class MultiObjectiveBetaBandit:
         
         return np.clip(expected, 0.01, 0.99)
 
-    def choose_arm(self, context, method="thompson", objective_weights=None):
-        """Choose arm using Thompson sampling or expected values"""
+    def choose_arm(self, context, method="thompson", objective_weights=None, exploration_factor=0.5):
+        """Choose arm using Thompson sampling or expected values with exploration"""
         if objective_weights is None:
             objective_weights = np.ones(self.n_objectives) / self.n_objectives
         
         if method == "thompson":
-            # Sample from posterior Beta distributions
-            samples = np.zeros((self.n_arms, self.n_objectives))
-            for arm in range(self.n_arms):
-                for obj in range(self.n_objectives):
-                    samples[arm, obj] = np.random.beta(self.alpha[arm, obj], self.beta[arm, obj])
+            # Thompson sampling with exploration bonus
+            scores = np.zeros(self.n_arms)
             
-            # Weight objectives and get scores
-            scores = np.dot(samples, objective_weights)
+            for arm in range(self.n_arms):
+                # Sample from posterior Beta distribution
+                sample = np.array([np.random.beta(self.alpha[arm, obj], self.beta[arm, obj]) 
+                                 for obj in range(self.n_objectives)])
+                
+                # Calculate base score
+                base_score = np.dot(sample, objective_weights)
+                
+                # Add exploration bonus based on uncertainty
+                uncertainty = self.get_arm_uncertainty(arm)
+                exploration_bonus = exploration_factor * uncertainty
+                
+                scores[arm] = base_score + exploration_bonus
+            
+            return np.argmax(scores)
+            
         else:
             # Use expected values
             expected = self.expected_rewards(context)
             scores = np.dot(expected, objective_weights)
-        
-        return np.argmax(scores)
+            return np.argmax(scores)
 
-# Example usage with your reward function
-def simulate_bandit_experiment():
-    # Initialize bandit and reward parameters
-    n_arms = 4
-    n_features = 8  # 5 features + 3 reward components
-    bandit = MultiObjectiveBetaBandit(n_arms, n_features)
-    
-    # Example base parameters (would come from your data)
-    engagement_base = {'0.mean': 0.6, '0.std': 0.1, '1.mean': 0.7, '1.std': 0.1,
-                      '2.mean': 0.5, '2.std': 0.2, '3.mean': 0.8, '3.std': 0.1}
-    revenue_increment_base = {'0.mean': 0.4, '0.std': 0.2, '1.mean': 0.3, '1.std': 0.1,
-                             '2.mean': 0.5, '2.std': 0.2, '3.mean': 0.6, '3.std': 0.1}
-    diversity_base = {'0.mean': 0.7, '0.std': 0.1, '1.mean': 0.5, '1.std': 0.2,
-                     '2.mean': 0.6, '2.std': 0.1, '3.mean': 0.4, '3.std': 0.2}
-    
-    # Simulation loop
-    for i in range(1000):
-        # Generate random user features (last 3 will be used as rewards in non-simulate mode)
-        user_features = np.random.uniform(0, 1, n_features)
-        
-        # Choose arm
-        arm = bandit.choose_arm(user_features[:5])  # Use first 5 features as context
-        
-        # Calculate rewards using your function
-        rewards = calculate_true_rewards(
-            user_features, engagement_base, revenue_increment_base, 
-            diversity_base, arm, simulate=True
-        )
-        
-        # Update bandit
-        bandit.update(user_features[:5], arm, rewards)
-        
-        if i % 100 == 0:
-            expected = bandit.expected_rewards(user_features[:5])
-            print(f"Step {i}: Arm {arm} - Rewards: {rewards}")
-            print(f"Expected: {np.mean(expected, axis=1)}")
-    
-    return bandit
-
-# Run the simulation
-if __name__ == "__main__":
-    bandit = simulate_bandit_experiment()
+    def get_arm_statistics(self, arm):
+        """Get comprehensive statistics for an arm"""
+        stats = {
+            'pulls': self.n_pulls[arm],
+            'means': self.alpha[arm] / (self.alpha[arm] + self.beta[arm]),
+            'uncertainties': [self.get_uncertainty(arm, obj) for obj in range(self.n_objectives)],
+            'alpha_params': self.alpha[arm].copy(),
+            'beta_params': self.beta[arm].copy()
+        }
+        return stats
