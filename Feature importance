@@ -1,0 +1,33 @@
+def get_feature_importance(bandit, feature_names, objective_names=None):
+    """
+    Extract feature importance from bandit weights
+    Returns: DataFrame with feature importance for each arm and objective
+    """
+    if objective_names is None:
+        objective_names = [f'Objective_{i}' for i in range(bandit.n_objectives)]
+    
+    importance_data = []
+    
+    for arm in range(bandit.n_arms):
+        for obj in range(bandit.n_objectives):
+            weights = bandit.mu[arm, obj]  # Learned weights
+            
+            for feature_idx, weight in enumerate(weights):
+                importance_data.append({
+                    'arm': arm,
+                    'objective': objective_names[obj],
+                    'feature': feature_names[feature_idx],
+                    'weight': weight,
+                    'absolute_importance': abs(weight)
+                })
+    
+    return pd.DataFrame(importance_data)
+
+# Usage
+feature_names = ['age', 'income', 'credit_score', 'num_products', 
+                 'savings_balance', 'checking_balance', 'days_since_last_login',
+                 'has_mortgage', 'is_premium_customer']
+
+objective_names = ['engagement', 'conversion', 'profit']
+
+importance_df = get_feature_importance(bandit, feature_names, objective_names)
