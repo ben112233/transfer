@@ -1,0 +1,703 @@
+"""New Contextual Bandit Code.ipynb
+"""
+
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+import matplotlib.pyplot as plt
+
+
+class MultiObjectiveLinearTS:
+    """
+    Multi-Objective Linear Thompson Sampling Bandit (接口保持一致)
+    【重要说明 / Q-learning替换点】
+    - choice(): 改为 ε-greedy 基于线性Q(s,a)=θ_a^T x（原TS采样弃用）
+    - update(): 改为TD更新（γ=0，单步任务）；同时保留B/f/mu仅用于expected_rewards/expected_rewards_proba的展示
+    - 其余接口/字段保持不变，以保证整份Notebook无缝运行
+    """
+    def __init__(self, n_arms, n_features, n_objectives, alpha=1.0,
+                 # ====== Q-learning 超参（新增；保留默认值不破坏旧调用） ======
+                 q_lr=0.05,              # Q学习率
+                 epsilon=0.10,           # ε-greedy 初始探索率
+                 epsilon_min=0.02,       # ε最小值
+                 epsilon_decay=0.999,    # ε每次update后的衰减
+                 gamma=0.0,              # 单步任务→0
+                 reward_weights=(0.5, 0.5),   # 两柱加权（engagement, revenue_increment）
+                 profit_normalizer=1.0):      # 预留（真实数据当前无profit，可忽略）
+
+        self.n_arms = n_arms
+        self.n_features = n_features
+        self.n_objectives = n_objectives
+        self.alpha = alpha  # 保留占位，不用于动作选择
+
+        # ========= 保留原贝叶斯线性参数，用于 expected_* 展示 =========
+        self.B = np.array([np.eye(n_features) for _ in range(n_arms * n_objectives)]) \
+                    .reshape(n_arms, n_objectives, n_features, n_features)
+        self.mu = np.zeros((n_arms, n_objectives, n_features))
+        self.f = np.zeros((n_arms, n_objectives, n_features))
+
+        self.total_rewards = np.zeros((n_arms, n_objectives))
+        self.counts = np.zeros(n_arms)
+
+        # 训练/调试历史（原文件使用到）
+        self.history = {
+            'arms_chosen': [],
+            'rewards': [],
+            'contexts': [],
+            'predictions': []
+        }
+
+        # ========= 【Q-learning 新增】线性Q参数 θ_a =========
+        # Q(s,a)=θ_a^T x
+        self.q_theta = np.zeros((n_arms, n_features))
+
+        # Q超参
+        self.q_lr = float(q_lr)
+        self.epsilon = float(epsilon)
+        self.epsilon_min = float(epsilon_min)
+        self.epsilon_decay = float(epsilon_decay)
+        self.gamma = float(gamma)
+
+        # 标量化权重（两柱：engagement, revenue_increment）
+        self.reward_weights = np.array(reward_weights, dtype=float)
+        self.profit_normalizer = float(profit_normalizer)
+
+    def choice(self, context):
+        """【Q-learning改动】ε-greedy 动作选择（替代原TS采样 + 多目标加权）"""
+        x = np.asarray(context).reshape(-1)
+        if np.random.rand() < self.epsilon:
+            chosen_arm = np.random.randint(self.n_arms)
+            self.history['arms_chosen'].append(chosen_arm)
+            return chosen_arm
+        q_values = self.q_theta @ x  # shape: (n_arms,)
+        chosen_arm = int(np.argmax(q_values))
+        self.history['arms_chosen'].append(chosen_arm)
+        # 可选：记录当前估计的标量Q用于debug
+        self.history['predictions'].append(q_values.copy())
+        return chosen_arm
+
+    def update(self, context, arm, reward):
+        """【Q-learning改动】TD 更新 Q；同时保留B/f/mu用于 expected_* 展示"""
+        x = np.asarray(context).reshape(-1)
+        r_vec = np.asarray(reward).reshape(-1)
+
+        # —— 标量化两柱奖励（与业务权重一致；真实数据无profit）——
+        r_scalar = float(self.reward_weights[0] * r_vec[0] +
+                         self.reward_weights[1] * r_vec[1])
+
+        # —— TD 更新（单步：target=r）——
+        q_pred = float(self.q_theta[arm] @ x)
+        target = r_scalar if self.gamma == 0.0 else r_scalar  # 预留扩展
+        td_error = target - q_pred
+        self.q_theta[arm] += self.q_lr * td_error * x
+
+        # 衰减 ε
+        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+
+        # —— 保留原B/f/mu更新（仅用于 expected_* 展示，不参与动作选择）——
+        self.counts[arm] += 1
+        self.total_rewards[arm] += r_vec
+        self.history['rewards'].append(r_vec)
+        self.history['contexts'].append(x)
+
+        for obj in range(self.n_objectives):
+            try:
+                self.B[arm, obj] += np.outer(x, x)
+                self.f[arm, obj] += r_vec[obj] * x
+                self.mu[arm, obj] = np.linalg.inv(self.B[arm, obj]) @ self.f[arm, obj]
+            except np.linalg.LinAlgError:
+                # 数值稳定性处理
+                self.B[arm, obj] += np.outer(x, x) + 1e-6 * np.eye(self.n_features)
+                self.mu[arm, obj] = np.linalg.inv(self.B[arm, obj]) @ self.f[arm, obj]
+
+    def expected_rewards(self, context):
+        """保持原接口：返回线性输出（用于可视化，不参与动作选择）"""
+        x = np.asarray(context).reshape(-1)
+        expected = np.zeros((self.n_arms, self.n_objectives))
+        for arm in range(self.n_arms):
+            for obj in range(self.n_objectives):
+                expected[arm, obj] = float(self.mu[arm, obj] @ x)
+        return expected
+
+    def expected_rewards_proba(self, context):
+        """保持原接口：返回Sigmoid后的概率（用于打印展示）"""
+        x = np.asarray(context).reshape(-1)
+        expected = np.zeros((self.n_arms, self.n_objectives))
+        for arm in range(self.n_arms):
+            for obj in range(self.n_objectives):
+                linear_pred = float(self.mu[arm, obj] @ x)
+                expected[arm, obj] = 1.0 / (1.0 + np.exp(-linear_pred))
+        return expected
+
+    # ====== 兼容保存：若外部代码调用 get_params() 保存模型，这里给出占位实现 ======
+    def get_params(self):
+        """返回用于 np.savez(*bandit.get_params()) 的元组顺序。
+        【注意】若你使用自定义 save_model/load_model，更推荐调用它们。
+        """
+        return (self.B, self.mu, self.f, self.total_rewards, self.counts, self.q_theta)
+
+    # ---------------- 调试（按你旧版布局，改为Q视角） ----------------
+    def debug_bandit(self, test_df=None, scaler=None, feature_columns=None, n_preview=3, topk=5):
+        import numpy as np
+        print("\n" + "="*60)
+        print("BANDIT DEBUG INFORMATION (Q-learning)")
+        print("="*60)
+
+        # 1) 选择分布
+        print("\n#1. Arm Selection Counts:")
+        if self.history.get("arms_chosen"):
+            arms = np.array(self.history["arms_chosen"])
+            total = len(arms)
+            for a in range(self.n_arms):
+                cnt = int(np.sum(arms == a))
+                pct = (cnt / total * 100.0) if total > 0 else 0.0
+                print(f"  Arm {a}: {cnt:6d} selections ({pct:6.2f}%)")
+        else:
+            print("  (no selection history yet)")
+
+        # 2) 历史回报统计
+        print("\n#2. Reward Statistics (history):")
+        if self.history.get("rewards"):
+            R = np.array(self.history["rewards"])
+            labels = ["Engagement", "Revenue Increment"] if self.n_objectives == 2 else [f"obj_{i}" for i in range(self.n_objectives)]
+            for j, name in enumerate(labels):
+                col = R[:, j]
+                print(f"  {name:>17}: mean={col.mean():.3f}  std={col.std():.3f}  min={col.min():.3f}  max={col.max():.3f}")
+        else:
+            print("  (no reward history yet)")
+
+        # 3) Q 参数概览
+        print("\n#3. Q parameter summary (per arm):")
+        for a in range(self.n_arms):
+            theta = np.asarray(self.q_theta[a]).reshape(-1)
+            l2 = float(np.linalg.norm(theta))
+            k = min(topk, len(theta))
+            idx = np.argsort(np.abs(theta))[-k:][::-1]
+            if feature_columns is not None:
+                feat_names = [str(feature_columns[i]) for i in idx]
+            else:
+                feat_names = [f"f{i}" for i in idx]
+            pairs = ", ".join([f"{n}:{theta[i]:+.3f}" for n, i in zip(feat_names, idx)])
+            print(f"  Arm {a}: ||theta||2={l2:.3f}  top|w| -> {pairs}")
+
+        # 4) epsilon
+        print(f"\n#4. Policy (epsilon-greedy):  epsilon={self.epsilon:.4f}  (min={self.epsilon_min}, decay={self.epsilon_decay})")
+
+        # 5) Q 预览
+        if (test_df is not None) and (scaler is not None) and (feature_columns is not None) and (n_preview > 0):
+            try:
+                print(f"\n#5. Q-value preview on first {n_preview} samples:")
+                Xp = scaler.transform(test_df[feature_columns].iloc[:n_preview])
+                for i in range(Xp.shape[0]):
+                    q_vals = (self.q_theta @ Xp[i]).astype(float)
+                    chosen = int(np.argmax(q_vals))
+                    q_list = ", ".join([f"{v:.3f}" for v in q_vals])
+                    print(f"  sample {i}: Q={q_list}  -> argmax={chosen}")
+            except Exception as e:
+                print("  (preview skipped:", e, ")")
+
+        print("\n" + "="*60)
+
+    # ---------------- 保存（兼容 .npz/.npy） ----------------
+    def save_model(self, filepath):
+        payload = dict(
+            n_arms=self.n_arms, n_features=self.n_features, n_objectives=self.n_objectives,
+            alpha=self.alpha,
+            B=self.B, mu=self.mu, f=self.f,
+            total_rewards=self.total_rewards, counts=self.counts,
+            q_theta=self.q_theta,
+            q_lr=self.q_lr, epsilon=self.epsilon, epsilon_min=self.epsilon_min,
+            epsilon_decay=self.epsilon_decay, gamma=self.gamma,
+            reward_weights=self.reward_weights, profit_normalizer=self.profit_normalizer
+        )
+        if str(filepath).lower().endswith(".npz"):
+            np.savez_compressed(filepath, **payload)
+        else:
+            np.save(filepath, payload, allow_pickle=True)
+        print(f"Model saved to {filepath}")
+
+    # ---------------- 加载（同时兼容“*get_params()保存”的旧格式） ----------------
+    def load_model(self, filepath):
+        if str(filepath).lower().endswith(".npz"):
+            z = np.load(filepath, allow_pickle=True)
+            if "arr_0" in z.files:
+                # 兼容旧保存法：np.savez(..., *bandit.get_params())
+                arr = [z[f"arr_{i}"] for i in range(len(z.files))]
+                self.B, self.mu, self.f, self.total_rewards, self.counts = arr[:5]
+                self.q_theta = arr[5] if len(arr) > 5 else np.zeros((self.n_arms, self.n_features))
+            else:
+                d = {k: z[k] for k in z.files}
+                self._load_from_dict(d)
+        else:
+            obj = np.load(filepath, allow_pickle=True)
+            d = obj.item() if hasattr(obj, "item") else obj
+            self._load_from_dict(d)
+        print(f"Model loaded from {filepath}")
+        return self
+
+    # 内部：从 dict 恢复（用于新版 save_model）
+    def _load_from_dict(self, d):
+        n_arms = int(d.get("n_arms", self.n_arms))
+        n_features = int(d.get("n_features", self.n_features))
+        n_objectives = int(d.get("n_objectives", self.n_objectives))
+        if (n_arms != self.n_arms) or (n_features != self.n_features) or (n_objectives != self.n_objectives):
+            self.n_arms, self.n_features, self.n_objectives = n_arms, n_features, n_objectives
+            self.B = np.array([np.eye(self.n_features) for _ in range(self.n_arms * self.n_objectives)]) \
+                        .reshape(self.n_arms, self.n_objectives, self.n_features, self.n_features)
+            self.mu = np.zeros((self.n_arms, self.n_objectives, self.n_features))
+            self.f = np.zeros((self.n_arms, self.n_objectives, self.n_features))
+            self.total_rewards = np.zeros((self.n_arms, self.n_objectives))
+            self.counts = np.zeros(self.n_arms)
+            self.q_theta = np.zeros((self.n_arms, self.n_features))
+        for key in ["B", "mu", "f", "total_rewards", "counts", "q_theta"]:
+            if key in d: setattr(self, key, d[key])
+        if "q_lr" in d: self.q_lr = float(d["q_lr"])
+        if "epsilon" in d: self.epsilon = float(d["epsilon"])
+        if "epsilon_min" in d: self.epsilon_min = float(d["epsilon_min"])
+        if "epsilon_decay" in d: self.epsilon_decay = float(d["epsilon_decay"])
+        if "gamma" in d: self.gamma = float(d["gamma"])
+        if "reward_weights" in d: self.reward_weights = np.array(d["reward_weights"], dtype=float)
+        if "profit_normalizer" in d: self.profit_normalizer = float(d["profit_normalizer"])
+
+
+def calculate_true_rewards(user_features, engagement_base, revenue_increment_base, arm, simulate=False):
+    if simulate:
+        engagement = np.random.normal(engagement_base[f"{arm}_mean"], engagement_base[f"{arm}_std"])
+        revenue_increment = np.random.normal(revenue_increment_base[f"{arm}_mean"], revenue_increment_base[f"{arm}_std"])
+    else:
+        engagement = user_features[-2]
+        revenue_increment = user_features[-1]
+
+    engagement = np.clip(engagement + np.random.normal(0, 0.1), 0.05, 0.95)
+    revenue_increment = np.clip(revenue_increment + np.random.normal(0, 0.1), 0.05, 0.95)
+
+    engagement = 1 if engagement > 0.5 else 0
+    revenue_increment = 1 if revenue_increment > 0.5 else 0
+    return np.array([engagement, revenue_increment])
+
+# In [4]
+print("Loading Data")
+CUSTOMER_FEATURES = pd.read_csv('data/CUSTOMER_FEATURES_V1.csv')
+product_features = pd.read_csv('data/product_features_v2.csv')
+interactions = pd.read_csv('data/model_input.csv')
+
+# In [5]
+interactions.PRODUCT_ID = interactions.PRODUCT_ID.astype(int)
+
+# In [6]
+interactions.isna().sum()
+
+# In [7]
+interactions.groupby('VERSION_DATE')['CUST_SERIAL_NO'].count()
+
+# In [8]
+train = interactions[interactions['VERSION_DATE'] <= '2024-09-30']
+test = interactions[(interactions['VERSION_DATE'] > '2024-09-30') & (interactions['VERSION_DATE'] <= '2024-12-31')]
+validation = interactions[(interactions['VERSION_DATE'] > '2024-12-31') & (interactions['VERSION_DATE'] <= '2025-01-31')]
+
+train.PRODUCT_ID.value_counts()
+
+def get_base_values(base_df, df):
+    """Get base value for different objectives for all arms"""
+    engagement_base = {}         # Engagement 基准值
+    revenue_increment_base = {} # Revenue Increment 基准值
+    diversity_base = {}          # Product Diversity（如适用）
+
+    for prod in sorted(base_df['PRODUCT_ID'].unique()):
+        tmp = df[df['PRODUCT_ID'] == prod]
+
+        # --- Overall dataset的均值 ---
+        base_engagement_mean = base_df[base_df['OVERALL_TRIGGER_RESPONSE'] > 0]['OVERALL_TRIGGER_RESPONSE'].mean()
+        base_engagement_std = base_df[base_df['OVERALL_TRIGGER_RESPONSE'] > 0]['OVERALL_TRIGGER_RESPONSE'].std()
+        base_revenue_increment_mean = base_df[base_df['TOTAL_REVENUE'] > 0]['TOTAL_REVENUE'].mean()
+        base_revenue_increment_std = base_df[base_df['TOTAL_REVENUE'] > 0]['TOTAL_REVENUE'].std()
+        base_diversity_mean = base_df['NORM_PRODUCT_DIVERSITY'].mean()
+        base_diversity_std = base_df['NORM_PRODUCT_DIVERSITY'].std()
+
+        # --- 当前产品（arm）的均值 ---
+        tmp_engagement_mean = tmp[tmp['OVERALL_TRIGGER_RESPONSE'] > 0]['OVERALL_TRIGGER_RESPONSE'].mean()
+        tmp_engagement_std = tmp[tmp['OVERALL_TRIGGER_RESPONSE'] > 0]['OVERALL_TRIGGER_RESPONSE'].std()
+        tmp_revenue_increment_mean = tmp[tmp['TOTAL_REVENUE'] > 0]['TOTAL_REVENUE'].mean()
+        tmp_revenue_increment_std = tmp[tmp['TOTAL_REVENUE'] > 0]['TOTAL_REVENUE'].std()
+        tmp_diversity_mean = tmp['NORM_PRODUCT_DIVERSITY'].mean()
+        tmp_diversity_std = tmp['NORM_PRODUCT_DIVERSITY'].std()
+
+        if tmp.empty:
+            # 使用全体 base 均值
+            engagement_base[f"{prod}_mean"] = base_engagement_mean
+            engagement_base[f"{prod}_std"] = base_engagement_std
+
+            revenue_increment_base[f"{prod}_mean"] = base_revenue_increment_mean
+            revenue_increment_base[f"{prod}_std"] = base_revenue_increment_std
+
+            diversity_base[f"{prod}_mean"] = base_diversity_mean
+            diversity_base[f"{prod}_std"] = base_diversity_std
+        else:
+            engagement_base[f"{prod}_mean"] = (
+                base_engagement_mean if not isinstance(tmp_engagement_mean, float) else tmp_engagement_mean
+            )
+            engagement_base[f"{prod}_std"] = (
+                base_engagement_std if not isinstance(tmp_engagement_std, float) else tmp_engagement_std
+            )
+
+            revenue_increment_base[f"{prod}_mean"] = (
+                base_revenue_increment_mean if not isinstance(tmp_revenue_increment_mean, float) else tmp_revenue_increment_mean
+            )
+            revenue_increment_base[f"{prod}_std"] = (
+                base_revenue_increment_std if not isinstance(tmp_revenue_increment_std, float) else tmp_revenue_increment_std
+            )
+
+            diversity_base[f"{prod}_mean"] = (
+                base_diversity_mean if not isinstance(tmp_diversity_mean, float) else tmp_diversity_mean
+            )
+            diversity_base[f"{prod}_std"] = (
+                base_diversity_std if not isinstance(tmp_diversity_std, float) else tmp_diversity_std
+            )
+
+    return engagement_base, revenue_increment_base, diversity_base
+
+# 获取每个数据集的基准值
+train_engagement_base, train_revenue_increment_base, train_diversity_base = get_base_values(interactions, train)
+test_engagement_base, test_revenue_increment_base, test_diversity_base = get_base_values(interactions, test)
+validation_engagement_base, validation_revenue_increment_base, validation_diversity_base = get_base_values(interactions, validation)
+
+# In [12]
+# Feature columns for ML model
+feature_columns = [
+    "PRODUCT_ID",
+    "LAST_ACCEPTED_PRODUCT",
+    "PROD_HOLDING",
+    # "TOTAL_AVBAL",  # 其他备用特征
+    "DEPOSIT_AVBAL", "CURSAV_AVBAL", "TMD_AVBAL", "LOAN_AVBAL",
+    "DEPOSIT_TOLM",
+    "MPF_TOLM",
+    "REMITTANCE_TOLM",
+    "CEM_SEGMENT",
+    "CEM_SEGMENT_1",
+    "CEM_SEGMENT_2",
+    "CEM_SEGMENT_3",
+    "CEM_SEGMENT_4",
+    "CEM_SEGMENT_5",
+    "Disengaging Recently",
+    "Engaging",
+    "Engaging Recently",
+    "Main Bank",
+    "Operational Bankers",
+    "Secondary",
+    "RBL_USAGEGROWTH_BUCKET",
+    "RBL_ANTIATTRITION_BUCKET",
+    "RBL_ACQUISITION_BUCKET",
+    "FX_USAGEGROWTH_BUCKET",
+    "FX_REVENUE_BUCKET",
+    "FX_ACQUISITION_BUCKET",
+    "MED_DEPOSIT_INCREASE_BUCKET",
+    "HIGH_DEPOSIT_INCREASE_BUCKET",
+    "MED_DEPOSIT_DECREASE_BUCKET",
+    "HIGH_DEPOSIT_DECREASE_BUCKET",
+    "RELATIONSHIP_YEAR",
+    "NTP_FLAG",
+    "IS_GROUP",
+    "IND_DES2_AGRIC/FORESTRY/FISH",
+    "IND_DES2_BUSINESS_SERVICES",
+    "IND_DES2_COMMUNICATION",
+    "IND_DES2_COMPANY_SERVICES",
+    "IND_DES2_CONGLOMERATES",
+    "IND_DES2_CONSTRUCTION",
+    "IND_DES2_ELECTRICITY/WATER",
+    "IND_DES2_FINANCE/INSURANCE",
+    "IND_DES2_HOTEL / CATERING",
+    "IND_DES2_MANUFACTURING",
+    "IND_DES2_MINING",
+    "IND_DES2_OTHER NOT SPECIFIED",
+    "IND_DES2_PERSONAL_SERVICES",
+    "IND_DES2_PROFESSIONAL/SERVICES",
+    "IND_DES2_REAL ESTATE",
+    "IND_DES2_RETAIL",
+    "IND_DES2_TRADES",
+    "IND_DES2_TRANSPORT",
+    "IND_DES2_WHOLESALES",
+    "SEG_DIV_3-C",
+    "SEG_DIV_3-BBD_RM",
+    "SEG_DIV_3-CR_RM",
+    "SEG_DIV_3-D_BBD_RM",
+    "SEG_DIV_3-D_CR_RM",
+    "SEG_DIV_3",
+    "SEG_DES2",
+    "SEG_DES7",
+    "OVERALL_TRIGGER_RESPONSE", "TOTAL_REVENUE", "NORM_PRODUCT_DIVERSITY"  # reward-related
+]
+# Normalize features
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(train[feature_columns])
+
+X_scaled
+
+# 4. Initialize the Multi-objective bandit
+n_arms = product_features.PRODUCT_ID.nunique()  # number of banking products
+n_features = len(feature_columns)
+n_objectives = 2  # engagement, revenue_increment (product diversity not used)
+bandit = MultiObjectiveLinearTS(n_arms, n_features, n_objectives, alpha=1.0)
+
+from tqdm import tqdm
+
+# 5. Train the bandit
+print("\nTraining bandit on historical data...")
+historical_rewards = []
+
+for i in tqdm(range(len(train))):
+    if i % 500 == 0:
+        print(f"Processing sample {i}/{len(train)}")
+
+    context = X_scaled[i]
+
+    print("ENGAGEMENT, NORM_REVENUE, NORM_PRODUCT_DIVERSITY")
+    display(train[["ENGAGEMENT", "NORM_REVENUE", "NORM_PRODUCT_DIVERSITY"]].iloc[i].values)
+
+    print("OVERALL_TRIGGER_RESPONSE, TOTAL_REVENUE, PROD_HOLDING")
+    display(train[["OVERALL_TRIGGER_RESPONSE", "TOTAL_REVENUE", "PROD_HOLDING"]].iloc[i].values)
+
+    # Mixed strategy for historical training
+    if np.random.random() < 1:
+        # Some business rules
+        arm = train["PRODUCT_ID"].iloc[i]
+        reward = calculate_true_rewards(
+            train[feature_columns].iloc[i].values,
+            train_engagement_base,
+            train_revenue_increment_base,
+            # train_diversity_base,
+            arm
+        )
+    else:
+        arm = np.random.randint(n_arms)
+        reward = calculate_true_rewards(
+            train[feature_columns].iloc[i].values,
+            train_engagement_base,
+            train_revenue_increment_base,
+            # train_diversity_base,
+            arm
+        )
+
+    historical_rewards.append(reward)
+    bandit.update(context, int(arm), reward)
+
+print("Training completed!")
+
+# Save model
+np.savez("model_checkpoint/model_160925_2_reward_prob.npz", *bandit.get_params())
+print("Model saved to model_checkpoint/model_160925_2_reward_prob.npz")
+
+# Evaluate model A
+def evaluate_bandit(bandit, test_df, scaler, feature_columns, n_trials=100):
+    """Evaluate the bandit on test data"""
+    test_rewards = []
+    X_test = scaler.transform(test_df[feature_columns])
+
+    product_id_to_name = [
+        "Product_Card", "Product_PAC", "Product_Deposit", "Product_FX",
+        # "Product_Insurance",
+        "Product_Loan", "Product_Payroll", "Product_Remittance",
+        "Product_Security", "Product_Service", "Product_Trade",
+        "Service_Account_Opening", "Service_Activation",
+        "Service_Dormancy", "Service_Onboarding", "Service_Survey"
+    ]
+
+    for i in tqdm(range(min(n_trials, len(test_df)))):
+        context = X_test[i]
+        user_data = test_df.iloc[i]
+
+        recommended_arm = bandit.choice(context)
+        reward = calculate_true_rewards(
+            user_data[feature_columns].values,
+            test_engagement_base,
+            test_revenue_increment_base,
+            # test_diversity_base,
+            recommended_arm
+        )
+        test_rewards.append(reward)
+
+        if i < 3:
+            print(f"User {i}: Engagement={user_data['ENGAGEMENT']:.2f}, Revenue Increment=${user_data['TOTAL_REVENUE']:.3f}, "
+                  f"Product HOLDING={user_data['PROD_HOLDING']:.2f} -> Recommended: {product_id_to_name[recommended_arm]} -> "
+                  f"Reward: Engagement={reward[0]}, Revenue Increment={reward[1]:.2f}")
+
+    test_rewards = np.array(test_rewards)
+    avg_rewards = test_rewards.mean(axis=0)
+
+    print(f"\nAverage Test Performance ({n_trials} users):")
+    print(f"Engagement Rate: {avg_rewards[0]:.2f}")
+    print(f"Normalized Average Revenue Increment: {avg_rewards[1]:.3f}")
+
+    # Debug bandit performance on test set
+    bandit.debug_bandit()
+
+    return test_rewards
+
+# Evaluation Execution
+print(f"\nEvaluation on test set ({len(test)} users)...")
+test_rewards = evaluate_bandit(bandit, test, scaler, feature_columns, n_trials=1000)
+
+del bandit
+
+bandit = MultiObjectiveLinearTS(n_arms, n_features, n_objectives, alpha=1.0)
+bandit.load_model("model_checkpoint/model_160925_2_reward_prob.npz")
+
+# 7. Make recommendations for new users
+def recommend_product(user_data, bandit, scaler, feature_columns):
+    """Make a product recommendation for a new user"""
+    user_df = pd.DataFrame([user_data])
+    context = scaler.transform(user_df[feature_columns])[0]
+
+    recommended_arm = bandit.choice(context)
+    expected_rewards_proba = bandit.expected_rewards_proba(context)
+    print(expected_rewards_proba)
+
+    product_id_to_name = [
+        "product_Card",
+        "product_DBB",
+        "product_Deposit",
+        "product_FX",
+        "product_Insurance",
+        "product_Loan",
+        "product_Payroll",
+        "product_Remittance",
+        "product_Security",
+        "product_Service",
+        "product_Trade",
+        "service_Account_Opening",
+        "service_Activation",
+        "service_Dormancy",
+        "service_Onboarding",
+        "service_Survey"
+    ]
+
+    print("\nRecommendation for user:")
+    print(f"Last Product: {user_data['SELLING_FINAL']}, "
+          f"Engagement (Offer Acceptance): {user_data['OVERALL_TRIGGER_RESPONSE']}, "
+          f"Revenue Increment: {user_data['NORM_REVENUE']}, "
+          f"Product Diversity: {user_data['NORM_PRODUCT_DIVERSITY']}")
+    print(f"Recommended product: {product_id_to_name[recommended_arm]}")
+
+    print("\nExpected outcomes for all products:")
+    for i, product in enumerate(product_id_to_name):
+        engagement = expected_rewards_proba[i][0]
+        revenue_increment = expected_rewards_proba[i][1]
+        print(f"{product}: Engagement = {engagement:.3f}, Revenue Increment = {revenue_increment:.3f}")
+
+    return recommended_arm
+
+print("\n" + "="*60)
+print("PRODUCT RECOMMENDATIONS")
+print("="*60)
+
+for i in range(1):
+    user = validation[validation["TOTAL_REVENUE"] > 10].sample(1).iloc[0]
+    print(f"\n--- User {user['CUST_SERIAL_NO']} ---")
+    recommend_product(user, bandit, scaler, feature_columns)
+
+# 8. Performance analysis
+print("\n" + "="*60)
+print("PERFORMANCE ANALYSIS")
+print("="*60)
+
+def compare_with_random(test_df, n_trials=10000):
+    bandit_rewards = []
+    random_rewards = []
+
+    X_test = scaler.transform(test_df[feature_columns].iloc[:n_trials])
+
+    for i in tqdm(range(n_trials)):
+        context = X_test[i]
+        user_data = test_df.iloc[i]
+
+        # Bandit choice
+        bandit_arm = bandit.choice(context)
+        bandit_reward = calculate_true_rewards(
+            user_data[feature_columns].values,
+            validation_engagement_base,
+            validation_revenue_increment_base,
+            validation_diversity_base,
+            bandit_arm
+        )
+        bandit_rewards.append(bandit_reward)
+
+        # Random choice
+        random_arm = np.random.randint(n_arms)
+        random_reward = calculate_true_rewards(
+            user_data[feature_columns].values,
+            validation_engagement_base,
+            validation_revenue_increment_base,
+            validation_diversity_base,
+            random_arm,
+            simulate=True
+        )
+        random_rewards.append(random_reward)
+
+    bandit_rewards = np.array(bandit_rewards)
+    random_rewards = np.array(random_rewards)
+
+    print("Comparison with Random strategy:")
+    print(f"{'Metric':<20}{'Bandit':<10}{'Random':<10}{'Improvement':<12}")
+    print("-"*52)
+
+    metrics = ['Engagement', 'Revenue Increment', 'Product Diversity']
+    for i, metric in enumerate(metrics):
+        bandit_avg = np.nanmean(bandit_rewards[:, i])
+        random_avg = np.nanmean(random_rewards[:, i])
+        improvement = (bandit_avg - random_avg) / (random_avg + 1e-6) * 100
+        print(f"{metric:<20}{bandit_avg:.3f}{random_avg:.3f}{improvement:+.1f}%")
+
+compare_with_random(validation, n_trials=validation.shape[0])
+
+# 9. Plot learning progress
+plt.figure(figsize=(12, 8))
+
+# Subplot 1: Cumulative rewards
+cumulative_rewards = np.array(historical_rewards).cumsum(axis=0)
+plt.subplot(2, 2, 1)
+plt.plot(cumulative_rewards[:, 0], label='Engagement')
+plt.plot(cumulative_rewards[:, 1], label='Revenue Increment')
+plt.plot(cumulative_rewards[:, 2], label='Product Diversity')
+plt.xlabel('Users')
+plt.ylabel('Cumulative Reward')
+plt.title('Cumulative Rewards Over Time')
+plt.legend()
+
+# Subplot 2: Moving Average
+window = 100
+moving_avg = pd.DataFrame(historical_rewards).rolling(window=window).mean()
+plt.subplot(2, 2, 2)
+plt.plot(moving_avg[0], label='Engagement')
+plt.plot(moving_avg[1], label='Revenue Increment')
+plt.plot(moving_avg[2], label='Product Diversity')
+plt.xlabel('Users')
+plt.ylabel(f'Moving Average ({window} users)')
+plt.title('Performance Moving Average')
+plt.legend()
+
+# Subplot 3: Arm selection counts
+plt.subplot(2, 2, 3)
+
+arm_counts = [
+    np.sum([
+        historical_rewards[i]
+        for i in range(len(historical_rewards))
+        if np.argmax(bandit.expected_rewards(x_scaled[i]) @ [0.33, 0.33, 0.33]) == arm
+    ], axis=0)
+    for arm in range(n_arms)
+]
+
+products = product_id_to_name
+x = np.arange(n_arms)
+width = 0.25
+
+plt.bar(x - width, [count[0] for count in arm_counts], width, label='Engagement')
+plt.bar(x,         [count[1] for count in arm_counts], width, label='Revenue Increment')
+plt.bar(x + width, [count[2] for count in arm_counts], width, label='Product Diversity')
+plt.xlabel('Product')
+plt.ylabel('Total Reward')
+plt.title('Rewards by Product Type')
+plt.xticks(x, products, rotation=90)
+plt.legend()
+plt.tight_layout()
+plt.show()
